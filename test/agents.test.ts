@@ -12,6 +12,9 @@ import { promises as fs } from 'node:fs';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Caller } from '../src/main/agents.js';
 
+const browserControlMocks = vi.hoisted(() => ({ requestBrowserCorrelationScan: vi.fn(() => true) }));
+vi.mock('../src/main/browser-control.js', () => browserControlMocks);
+
 vi.mock('electron', () => ({
   safeStorage: {
     isAsyncEncryptionAvailable: async () => true,
@@ -1872,6 +1875,7 @@ describe('through the MCP endpoint', () => {
   };
 
   beforeEach(async () => {
+    browserControlMocks.requestBrowserCorrelationScan.mockClear();
     endpoint = await startMcpServer(() => ({
       roots: [],
       caps: { ...DEFAULT_CAPABILITIES },
@@ -1883,6 +1887,22 @@ describe('through the MCP endpoint', () => {
 
   afterEach(async () => {
     await endpoint.stop();
+  });
+
+  it('asks the browser for an immediate exact-id scan before waiting on an agents caller', async () => {
+    const requestId = 'wfr_agents_immediate_scan';
+    const pending = replyWithRequestId(requestId, 'status', {});
+    await vi.waitFor(() => expect(browserControlMocks.requestBrowserCorrelationScan).toHaveBeenCalledWith(requestId));
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-immediate-scan' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-immediate-scan',
+        calls: [{ messageId: 'm-immediate-scan', tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+    await expect(pending).resolves.toBeTruthy();
   });
 
   // One flat tool with five actions. The names it replaced are gone outright, not aliased,

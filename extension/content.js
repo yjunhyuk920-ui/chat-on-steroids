@@ -8440,6 +8440,25 @@
         sendResponse({ ok: true, enabled: RENDER_STREAM });
         return false;
       }
+      // The authenticated app saw an identity-sensitive MCP call before this hidden page's
+      // ordinary observer cadence found ChatGPT's matching metadata.request_id. Scan the page
+      // model now and flush the resulting exact evidence immediately. The request id is only a
+      // diagnostic correlation label here: it never selects a conversation and it never weakens
+      // refreshFiber's existing exact conversation/request checks.
+      if (message.type === 'clf-scan-now') {
+        const requestId = typeof message.requestId === 'string' && message.requestId.length <= 300
+          ? message.requestId
+          : null;
+        if (!requestId) {
+          sendResponse({ ok: false, error: 'bad_request_id' });
+          return false;
+        }
+        void refreshFiber()
+          .then(() => flush())
+          .then(() => sendResponse({ ok: true, requestId }))
+          .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
+        return true;
+      }
       // A revival the service worker wants to hand to the document that already has this chat.
       // The response is deliberately delayed until `/commands/redeem` made this exact document
       // the durable owner. background.js may close the app-opened fallback only after that fact,

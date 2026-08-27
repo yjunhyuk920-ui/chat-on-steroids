@@ -24,7 +24,10 @@ const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 8;
+const BRIDGE_PROTOCOL = 9;
+const CONTROL_RECONNECT_MS = 1500;
+const CONTROL_RECONNECT_MAX_MS = 30_000;
+const CONTROL_KEEPALIVE_MS = 20_000;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -88,6 +91,220 @@ let pairingEpoch = -1;
 let pairingReconnect = false;
 /** Most recent pairing failure, for the popup. Process-local and never a credential. */
 let pairingError = null;
+
+/**
+ * Authenticated app -> extension control channel.
+ *
+ * HTTP remains the durable data path. This small loopback WebSocket exists only for the two
+ * things that cannot wait for a polling tick: opening an app-created worker without taking the
+ * user's active tab, and asking already-open ChatGPT pages to publish exact request-id evidence
+ * while the matching MCP call is still waiting. The bearer token is sent only in the first
+ * WebSocket frame, never in the URL or into a content script.
+ */
+let controlSocket = null;
+let controlKeepalive = null;
+let controlReconnect = null;
+let controlReconnectDelay = CONTROL_RECONNECT_MS;
+
+function stopControlSocket() {
+  if (controlReconnect !== null) clearTimeout(controlReconnect);
+  controlReconnect = null;
+  controlReconnectDelay = CONTROL_RECONNECT_MS;
+  if (controlKeepalive !== null) clearInterval(controlKeepalive);
+  controlKeepalive = null;
+  const socket = controlSocket;
+  controlSocket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) {
+    try {
+      socket.close(1000, 'connection state changed');
+    } catch {
+      // The next explicit connect/status check rebuilds it.
+    }
+  }
+}
+
+function scheduleControlReconnect() {
+  if (controlReconnect !== null || disconnected || !token || !Number.isInteger(port)) return;
+  const delay = controlReconnectDelay;
+  controlReconnectDelay = Math.min(CONTROL_RECONNECT_MAX_MS, controlReconnectDelay * 2);
+  controlReconnect = setTimeout(() => {
+    controlReconnect = null;
+    ensureControlSocket();
+  }, delay);
+}
+
+function sendControl(message, socket = controlSocket) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  try {
+    socket.send(JSON.stringify(message));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validControlCommand(message) {
+  if (!message || typeof message.id !== 'string' || message.id.length < 1 || message.id.length > 200) return null;
+  if (typeof message.url !== 'string' || message.url.length > 2048) return null;
+  try {
+    const url = new URL(message.url);
+    if (url.protocol !== 'https:' || (url.hostname !== 'chatgpt.com' && url.hostname !== 'chat.openai.com')) return null;
+    if (markerFromUrl(url.toString()) !== message.id) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function openControlledCommand(message, socket) {
+  const url = validControlCommand(message);
+  if (!url) {
+    sendControl({ type: 'open_failed', id: typeof message?.id === 'string' ? message.id : null, error: 'invalid_command' }, socket);
+    return;
+  }
+
+  // Lost WebSocket ACKs and MV3 worker restarts must not duplicate a command tab. The marker is
+  // an inert id, but it is stable enough to prove that this browser already opened this job.
+  try {
+    const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    const existing = tabs.find(
+      (tab) => tab && typeof tab.id === 'number' && markerFromUrl(tab.pendingUrl || tab.url) === message.id
+    );
+    if (existing) {
+      sendControl({ type: 'opened', id: message.id, tabId: existing.id, reused: true }, socket);
+      return;
+    }
+  } catch {
+    // A query failure is not permission to focus anything; continue with inactive creation.
+  }
+
+  const create = { url, active: false };
+  try {
+    const active = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const current = active.find((tab) => tab && typeof tab.id === 'number' && typeof tab.windowId === 'number');
+    if (current) {
+      create.windowId = current.windowId;
+      create.openerTabId = current.id;
+    }
+  } catch {
+    // `active:false` is the focus guarantee; window/opener affinity is a best effort.
+  }
+
+  try {
+    const created = await chrome.tabs.create(create);
+    sendControl({ type: 'opened', id: message.id, tabId: created && typeof created.id === 'number' ? created.id : null }, socket);
+  } catch (err) {
+    sendControl({
+      type: 'open_failed',
+      id: message.id,
+      error: String(err && err.message ? err.message : err).slice(0, 300)
+    }, socket);
+  }
+}
+
+async function scanChatGptPages(message, socket) {
+  const requestId = typeof message?.requestId === 'string' && message.requestId.length <= 300 ? message.requestId : null;
+  if (!requestId) return;
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+  } catch {
+    tabs = [];
+  }
+  const eligible = tabs.filter((tab) => tab && typeof tab.id === 'number');
+  // Dispatch to every page before awaiting any answer. A scan can legitimately spend its Fiber
+  // timeout repairing one stale tab; serial sends would make a healthy worker later in the list
+  // miss the MCP identity window for no reason.
+  const results = await Promise.all(
+    eligible.map(async (tab) => {
+      try {
+        await chrome.tabs.sendMessage(tab.id, { type: 'clf-scan-now', requestId });
+        return true;
+      } catch {
+        // Navigating/dead recorders are repaired by the existing extension recovery path.
+        return false;
+      }
+    })
+  );
+  sendControl({
+    type: 'scan_complete',
+    requestId,
+    attempted: eligible.length,
+    delivered: results.filter(Boolean).length
+  }, socket);
+}
+
+function handleControlMessage(raw, socket) {
+  if (socket !== controlSocket || typeof raw !== 'string' || raw.length > 4096) return;
+  let message = null;
+  try {
+    message = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (!message || typeof message.type !== 'string') return;
+  if (message.type === 'open_command') {
+    void openControlledCommand(message, socket);
+  } else if (message.type === 'scan_request') {
+    void scanChatGptPages(message, socket);
+  } else if (message.type === 'error') {
+    if (message.error === 'browser_disconnected') {
+      void latchAppDisconnect();
+    } else if (message.error === 'unauthorised') {
+      // The app was reinstalled or rotated its credential while this MV3 worker slept. Follow
+      // the same one-time repair as authenticated HTTP instead of reconnecting forever with a
+      // token the app has already rejected.
+      token = null;
+      stopControlSocket();
+      void persist().then(() => provision()).catch(() => undefined);
+    } else if (message.error === 'incompatible_extension') {
+      portCompatible = false;
+      stopControlSocket();
+    }
+  }
+}
+
+function ensureControlSocket() {
+  if (disconnected || !token || !Number.isInteger(port) || portCompatible === false) {
+    stopControlSocket();
+    return;
+  }
+  if (controlSocket && controlSocket.readyState <= WebSocket.OPEN) return;
+  if (controlReconnect !== null) clearTimeout(controlReconnect);
+  controlReconnect = null;
+
+  let socket;
+  try {
+    socket = new WebSocket(`ws://127.0.0.1:${port}/control`);
+  } catch {
+    scheduleControlReconnect();
+    return;
+  }
+  controlSocket = socket;
+  socket.onopen = () => {
+    if (socket !== controlSocket) return;
+    controlReconnectDelay = CONTROL_RECONNECT_MS;
+    sendControl({
+      type: 'auth',
+      token,
+      protocol: BRIDGE_PROTOCOL,
+      version: chrome.runtime.getManifest().version
+    }, socket);
+    if (controlKeepalive !== null) clearInterval(controlKeepalive);
+    controlKeepalive = setInterval(() => {
+      sendControl({ type: 'keepalive', at: Date.now() }, socket);
+    }, CONTROL_KEEPALIVE_MS);
+  };
+  socket.onmessage = (event) => handleControlMessage(typeof event.data === 'string' ? event.data : '', socket);
+  socket.onerror = () => undefined;
+  socket.onclose = () => {
+    if (socket !== controlSocket) return;
+    controlSocket = null;
+    if (controlKeepalive !== null) clearInterval(controlKeepalive);
+    controlKeepalive = null;
+    scheduleControlReconnect();
+  };
+}
 
 /**
  * When the app was last confirmed to be on `port`, and how long that is believed for.
@@ -165,9 +382,9 @@ let terminalDocuments = {};
  * Command ids this browser has already delivered.
  *
  * All that is left of the delivery bookkeeping. There used to be an `opened` list beside it,
- * for a periodic alarm that opened tabs for commands nobody had delivered; the app opens the
- * chat itself, exactly once, and a command that does not get taken up fails rather than being
- * arranged for again. This one stays because a marked page that reloads must not type the
+ * for a periodic alarm that polled for work and later opened it. Protocol 9 instead pushes the
+ * exact command over the authenticated control socket, and this worker creates its marked tab
+ * inactive exactly once. This one stays because a marked page that reloads must not type the
  * same bootstrap into a second conversation.
  */
 let settled = [];
@@ -253,6 +470,7 @@ async function loadOnce() {
     delivery = { ...delivery, ...live.delivery };
   }
   loaded = true;
+  ensureControlSocket();
 }
 
 async function persist() {
@@ -881,6 +1099,7 @@ function forgetPort() {
 async function latchAppDisconnect() {
   token = null;
   disconnected = true;
+  stopControlSocket();
   await persist();
 }
 
@@ -919,6 +1138,7 @@ async function call(path, init = {}, retried = false) {
       // rebuilt. Drop ours and provision a new one once, rather than retrying forever
       // with a credential that will never work again or making the user do it by hand.
       token = null;
+      stopControlSocket();
       await persist();
       if (retried) return { ok: false, status: 401, error: 'not_paired' };
       return call(path, init, true);
@@ -1001,6 +1221,8 @@ async function pairOnce(intent = connectionEpoch, reconnect = false) {
     // Connecting is the counterpart of disconnecting, and the only thing that clears it.
     disconnected = false;
     await persist();
+    stopControlSocket();
+    ensureControlSocket();
     scheduleRetry();
     return { ok: true };
   } catch (err) {
@@ -1645,6 +1867,7 @@ const HANDLERS = {
     // undo the thing the popup was opened to check.
     if (found && !token && !disconnected) await provision();
     if (found && token) {
+      ensureControlSocket();
       void drainCommandAcks()
         .then(() => drain())
         .then(() => drainCloses())
@@ -1673,6 +1896,7 @@ const HANDLERS = {
     connectionEpoch++;
     const result = await provision(true);
     if (result && result.ok) {
+      ensureControlSocket();
       void drainCommandAcks()
         .then(() => drain())
         .then(() => drainCloses())
@@ -1689,6 +1913,7 @@ const HANDLERS = {
     // open tab — provisions a new token and the browser is connected again.
     disconnected = true;
     pairingError = null;
+    stopControlSocket();
     await persist();
     return { ok: true };
   },
@@ -2246,7 +2471,7 @@ function markerFromUrl(value) {
 /**
  * Keeps a revival in the tab that chat is already open in.
  *
- * The app opens a URL; the browser makes a tab. That is the right answer for the two
+ * Command delivery creates a marked browser tab. That is the right answer for the two
  * commands that open a chat which does not exist yet, and the wrong one for the command that
  * names a chat the user may well be looking at right now: waking a worker would leave them
  * with the same conversation open twice, once per revival, which is exactly the pile of

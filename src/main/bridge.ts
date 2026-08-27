@@ -22,9 +22,11 @@
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
+import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import type { BridgeStatus } from '../shared/types.js';
 import type { SessionOrigin } from '../shared/session.js';
 import { getConfig, updateConfig } from './config.js';
+import { setBrowserCorrelationScanSender } from './browser-control.js';
 import { getSecret, secureStorageStatus, setSecret } from './secrets.js';
 import {
   ackGoalDraft,
@@ -362,6 +364,11 @@ export interface BridgeCommand {
 }
 
 let server: http.Server | null = null;
+let controlServer: WebSocketServer | null = null;
+let controlSocket: WebSocket | null = null;
+/** Once protocol 9 has proved the extension can open inactive tabs, never regress to the
+ * focus-stealing OS opener merely because that socket is reconnecting. */
+let controlEstablished = false;
 let port: number | null = null;
 let lastSeenAt: number | null = null;
 let browserPresenceTimer: NodeJS.Timeout | null = null;
@@ -446,6 +453,7 @@ export async function unpair(): Promise<void> {
   // This impossible-as-a-token sentinel preserves the user's explicit intent across both
   // the extension's next poll and an app restart.
   await setSecret('bridgeToken', BROWSER_DISCONNECTED);
+  closeBrowserControl(1008, 'browser disconnected');
   logInfo('bridge: browser disconnected');
   changed();
 }
@@ -493,6 +501,188 @@ function safeEqual(a: string, b: string): boolean {
   const bufB = Buffer.from(b, 'utf8');
   if (bufA.length !== bufB.length) return false;
   return timingSafeEqual(bufA, bufB);
+}
+
+function sendControl(message: Record<string, unknown>, socket = controlSocket): boolean {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  try {
+    socket.send(JSON.stringify(message));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+setBrowserCorrelationScanSender((requestId) => sendControl({ type: 'scan_request', requestId }));
+
+function closeBrowserControl(code = 1001, reason = 'bridge stopped'): void {
+  const active = controlSocket;
+  controlSocket = null;
+  if (active && active.readyState < WebSocket.CLOSING) {
+    try {
+      active.close(code, reason);
+    } catch {
+      active.terminate();
+    }
+  }
+}
+
+function disposeControlServer(): void {
+  closeBrowserControl();
+  const instance = controlServer;
+  controlServer = null;
+  if (!instance) return;
+  for (const client of instance.clients) client.terminate();
+  try {
+    instance.close();
+  } catch {
+    // A noServer WebSocketServer may already be closed while its HTTP owner is stopping.
+  }
+}
+
+function rejectUpgrade(socket: import('node:stream').Duplex, status: number, message: string): void {
+  if (!socket.writable) {
+    socket.destroy();
+    return;
+  }
+  const body = `${message}\n`;
+  socket.end(
+    `HTTP/1.1 ${status} ${message}\r\n` +
+      'Connection: close\r\n' +
+      'Content-Type: text/plain; charset=utf-8\r\n' +
+      `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`
+  );
+}
+
+function controlRawSize(raw: RawData): number {
+  if (Array.isArray(raw)) return raw.reduce((total, item) => total + item.length, 0);
+  return raw instanceof ArrayBuffer ? raw.byteLength : raw.length;
+}
+
+function controlRawText(raw: RawData): string {
+  if (Array.isArray(raw)) return Buffer.concat(raw).toString('utf8');
+  return raw instanceof ArrayBuffer ? Buffer.from(raw).toString('utf8') : raw.toString('utf8');
+}
+
+function refuseControl(socket: WebSocket, error: string, code = 1008): void {
+  if (socket.readyState !== WebSocket.OPEN) return socket.terminate();
+  socket.send(JSON.stringify({ type: 'error', error }), () => {
+    try {
+      socket.close(code, error.slice(0, 100));
+    } catch {
+      socket.terminate();
+    }
+  });
+}
+
+async function authenticateControl(socket: WebSocket, raw: RawData, isBinary: boolean): Promise<boolean> {
+  if (isBinary || controlRawSize(raw) > 4096) {
+    refuseControl(socket, 'bad_message');
+    return false;
+  }
+  let message: Record<string, unknown>;
+  try {
+    message = JSON.parse(controlRawText(raw)) as Record<string, unknown>;
+  } catch {
+    refuseControl(socket, 'bad_message');
+    return false;
+  }
+  if (message['type'] !== 'auth') {
+    refuseControl(socket, 'auth_required');
+    return false;
+  }
+  if (message['protocol'] !== BRIDGE_PROTOCOL) {
+    refuseControl(socket, 'incompatible_extension');
+    return false;
+  }
+  const supplied = typeof message['token'] === 'string' ? message['token'] : '';
+  const stored = await getSecret('bridgeToken');
+  if (stored === BROWSER_DISCONNECTED) {
+    refuseControl(socket, 'browser_disconnected');
+    return false;
+  }
+  if (!stored || !safeEqual(supplied, stored)) {
+    refuseControl(socket, 'unauthorised');
+    return false;
+  }
+  if (socket.readyState !== WebSocket.OPEN) return false;
+
+  const version = typeof message['version'] === 'string' ? message['version'].slice(0, 32) : null;
+  if (version && version !== extensionVersion) {
+    extensionVersion = version;
+    logInfo(`bridge: browser extension ${extensionVersion} control channel connected`);
+  }
+  const prior = controlSocket;
+  controlSocket = socket;
+  controlEstablished = true;
+  if (prior && prior !== socket) {
+    try {
+      prior.close(1000, 'newer extension control channel connected');
+    } catch {
+      prior.terminate();
+    }
+  }
+  if (noteBrowserSeen()) changed();
+  sendControl({ type: 'ready', protocol: BRIDGE_PROTOCOL, version: APP_VERSION }, socket);
+  deliver();
+  return true;
+}
+
+function attachControlServer(instance: http.Server): void {
+  const ws = new WebSocketServer({ noServer: true, maxPayload: 4096 });
+  controlServer = ws;
+  instance.on('upgrade', (req, socket, head) => {
+    const route = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    const origin = originOf(req);
+    if (route !== '/control') return rejectUpgrade(socket, 404, 'Not Found');
+    if (!origin.ok) return rejectUpgrade(socket, 403, 'Forbidden');
+    if (bridgeRecovering) return rejectUpgrade(socket, 503, 'Bridge Recovering');
+    ws.handleUpgrade(req, socket, head, (client) => ws.emit('connection', client, req));
+  });
+  ws.on('connection', (socket) => {
+    let authenticated = false;
+    let authenticating = false;
+    const authTimer = setTimeout(() => refuseControl(socket, 'auth_timeout'), 5000);
+    authTimer.unref?.();
+    socket.on('message', (raw, isBinary) => {
+      if (!authenticated) {
+        if (authenticating) return refuseControl(socket, 'auth_in_progress');
+        authenticating = true;
+        void authenticateControl(socket, raw, isBinary).then((ok) => {
+          authenticating = false;
+          if (!ok) return;
+          authenticated = true;
+          clearTimeout(authTimer);
+        });
+        return;
+      }
+      if (isBinary || controlRawSize(raw) > 4096) return refuseControl(socket, 'bad_message');
+      let message: Record<string, unknown>;
+      try {
+        message = JSON.parse(controlRawText(raw)) as Record<string, unknown>;
+      } catch {
+        return refuseControl(socket, 'bad_message');
+      }
+      if (message['type'] === 'keepalive') {
+        if (noteBrowserSeen()) changed();
+        sendControl({ type: 'keepalive_ack' }, socket);
+      } else if (message['type'] === 'open_failed') {
+        const id = typeof message['id'] === 'string' ? message['id'] : '';
+        const command = commands.find((entry) => entry.id === id) ?? null;
+        const detail = typeof message['error'] === 'string' ? message['error'].slice(0, 300) : 'unknown browser error';
+        logWarn(`bridge: browser extension could not open command ${id.slice(0, 80)} — ${detail}`);
+        if (command && command.owner === null) {
+          drop(command, `the browser extension could not create its background tab (${detail})`);
+          deliver();
+        }
+      }
+    });
+    socket.on('close', () => {
+      clearTimeout(authTimer);
+      if (controlSocket === socket) controlSocket = null;
+    });
+    socket.on('error', () => undefined);
+  });
 }
 
 /**
@@ -923,6 +1113,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // refuses anything that is not a chrome-extension:// origin, above.
     const token = randomBytes(32).toString('base64url');
     await setSecret('bridgeToken', token);
+    closeBrowserControl(1008, 'credential rotated');
     noteBrowserSeen();
     logInfo('bridge: browser extension connected and provisioned');
     changed();
@@ -2594,6 +2785,7 @@ async function closeCancelledBridgeStart(instance: http.Server, actual: number |
   if (server === instance) server = null;
   if (actual !== null && port === actual) port = null;
   bridgeRecovering = false;
+  disposeControlServer();
   if (instance.listening) {
     await new Promise<void>((resolve) => instance.close(() => resolve()));
   }
@@ -2614,6 +2806,7 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
   });
   instance.headersTimeout = 15_000;
   instance.requestTimeout = 30_000;
+  attachControlServer(instance);
 
   for (const candidate of PORTS) {
     const bound = await new Promise<boolean>((resolve) => {
@@ -2708,6 +2901,7 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
     }
   }
   bridgeRecovering = false;
+  disposeControlServer();
   logWarn(`bridge could not bind any of ports ${PORTS.join(', ')}; the browser extension will not connect`);
   return null;
 }
@@ -2728,6 +2922,7 @@ export async function stopBridge(): Promise<void> {
     if (!instance) return;
     if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
     browserPresenceTimer = null;
+    disposeControlServer();
     server = null;
     port = null;
     // A stopped listener cannot currently see the extension. Require one fresh authenticated
@@ -3343,10 +3538,11 @@ export function commandUrl(id: string, conversationId?: string | null): string {
  * happened to open ChatGPT again". Delivery used to be pull-only: the app queued a command
  * and waited for some ChatGPT tab's content script to poll for it, which meant a browser
  * with no ChatGPT tab open — or no browser at all — was a queue that nothing drained, and
- * which tab picked the job up was whichever one happened to ask. Opening the target chat
- * directly makes the app the active party: it launches the browser if it is closed, creates
- * the tab if there is none, and the marker in the URL tells that one page which command it
- * is for, so no other tab and no global pending slot is involved.
+ * which tab picked the job up was whichever one happened to ask. Protocol 9 makes the app
+ * the active party without making Electron take browser focus: it pushes the target URL to
+ * the authenticated extension, which creates an inactive tab beside the user's current tab.
+ * The marker tells that one page which command it is for, so no other tab and no global
+ * pending slot is involved. The OS opener remains only a compatibility/first-connection path.
  *
  * The poll route is gone with it, and so is the recovery it offered. One press opens one
  * chat; if that does not work, it fails and says so, rather than leaving a job in a queue
@@ -3364,7 +3560,14 @@ async function deliverOne(): Promise<void> {
   tidyCommands();
   const command = nextDeliverable();
   if (!command) return;
-  if (!openInBrowser) {
+  const controlled = controlSocket && controlSocket.readyState === WebSocket.OPEN ? controlSocket : null;
+  if (!controlled && controlEstablished) {
+    // Protocol 9 has already proved this browser can create an inactive tab. A transient socket
+    // reconnect must not silently regress to Electron launching Chrome and stealing focus. The
+    // command remains queued and the successful auth path calls deliver() immediately.
+    return;
+  }
+  if (!controlled && !openInBrowser) {
     // Nothing can open a browser in this process, and nothing will come and ask. Ending it
     // here is what keeps the failure honest: the continuation stays in the chat it is in and
     // the worker slot fails, instead of a job sitting in a queue that has no reader.
@@ -3390,7 +3593,14 @@ async function deliverOne(): Promise<void> {
       : `bridge: opening a fresh ChatGPT chat for ${specKey(command.spec)}`
   );
   try {
-    await openInBrowser(url);
+    if (controlled) {
+      const live = controlSocket && controlSocket.readyState === WebSocket.OPEN ? controlSocket : controlled;
+      if (!sendControl({ type: 'open_command', id: command.id, url }, live)) {
+        throw new Error('the authenticated browser control channel closed before delivery');
+      }
+    } else {
+      await openInBrowser!(url);
+    }
   } catch (err) {
     // One command is one browser-open attempt. A rejected opener can never produce an ACK,
     // so leaving the row unleased merely blocks everything behind it until some unrelated
@@ -4102,6 +4312,9 @@ export async function restoreCommands(): Promise<void> {
 
 /** Test seam. */
 export function resetBridgeForTests(): void {
+  closeBrowserControl(1001, 'test reset');
+  for (const client of controlServer?.clients ?? []) client.terminate();
+  controlEstablished = false;
   for (const command of commands) if (command.timer) clearTimeout(command.timer);
   if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
   browserPresenceTimer = null;

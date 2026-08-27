@@ -38,8 +38,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(8);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 8;');
+    expect(BRIDGE_PROTOCOL).toBe(9);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 9;');
   });
 
   /**
@@ -429,6 +429,12 @@ interface WorkerHarness {
   scriptingInsertCSS: ReturnType<typeof vi.fn>;
   alarmCreate: ReturnType<typeof vi.fn>;
   alarmClear: ReturnType<typeof vi.fn>;
+  controlSockets: Array<{
+    url: string;
+    sent: string[];
+    open(): void;
+    receive(message: Record<string, unknown>): void;
+  }>;
 }
 
 function response(status: number, data: unknown) {
@@ -450,7 +456,7 @@ function loadWorker(options: {
   session: FakeStorageArea;
   fetch?: (input: string, init?: Record<string, unknown>) => Promise<ReturnType<typeof response>>;
   tabsGet?: (tabId: number) => Promise<{ id?: number; url?: string; pendingUrl?: string; status?: string }>;
-  tabsQuery?: () => Promise<Array<{ id?: number; windowId?: number; url?: string; pendingUrl?: string }>>;
+  tabsQuery?: (query?: Record<string, unknown>) => Promise<Array<{ id?: number; windowId?: number; url?: string; pendingUrl?: string }>>;
   tabsSendMessage?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
 }): WorkerHarness {
   let listener: ((message: any, sender: any, sendResponse: (value: any) => void) => boolean) | null = null;
@@ -468,6 +474,44 @@ function loadWorker(options: {
   const alarmCreate = vi.fn(() => undefined);
   const alarmClear = vi.fn(async () => true);
   const windowsUpdate = vi.fn(async () => ({ id: 7 }));
+  const controlSockets: WorkerHarness['controlSockets'] = [];
+  class HarnessWebSocket {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSING = 2;
+    static readonly CLOSED = 3;
+
+    readonly url: string;
+    readonly sent: string[] = [];
+    readyState = HarnessWebSocket.CONNECTING;
+    onopen: ((event: Record<string, never>) => void) | null = null;
+    onmessage: ((event: { data: string }) => void) | null = null;
+    onclose: ((event: { code: number; reason: string }) => void) | null = null;
+    onerror: ((event: Record<string, never>) => void) | null = null;
+
+    constructor(url: string) {
+      this.url = url;
+      controlSockets.push(this);
+    }
+
+    open(): void {
+      this.readyState = HarnessWebSocket.OPEN;
+      this.onopen?.({});
+    }
+
+    send(payload: string): void {
+      this.sent.push(String(payload));
+    }
+
+    receive(message: Record<string, unknown>): void {
+      this.onmessage?.({ data: JSON.stringify(message) });
+    }
+
+    close(code = 1000, reason = ''): void {
+      this.readyState = HarnessWebSocket.CLOSED;
+      this.onclose?.({ code, reason });
+    }
+  }
   const documentNumbers = new Map<number, number>();
   const currentDocuments = new Map<number, string>();
   const documentFor = (tabId: number): string => {
@@ -538,8 +582,11 @@ function loadWorker(options: {
     AbortController,
     setTimeout,
     clearTimeout,
+    setInterval: () => 0,
+    clearInterval: () => undefined,
     URL,
     TextEncoder,
+    WebSocket: HarnessWebSocket,
     console
   }, { filename: 'background.js' });
   if (!listener) throw new Error('background.js did not register a message listener');
@@ -555,6 +602,7 @@ function loadWorker(options: {
     scriptingInsertCSS,
     alarmCreate,
     alarmClear,
+    controlSockets,
     async installed(reason = 'update') {
       for (const fn of installedListeners) fn({ reason });
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -631,6 +679,100 @@ function loadWorker(options: {
   };
 }
 
+const settleWorker = async (rounds = 8): Promise<void> => {
+  for (let round = 0; round < rounds; round += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+};
+
+describe('app-to-extension control channel', () => {
+  const paired = { port: 8765, token: 'paired-token' };
+
+  it('opens a fresh worker beside the current tab without activating or focusing it', async () => {
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsQuery: async (query = {}) => {
+        if (query.active === true) return [{ id: 12, windowId: 4, url: 'https://example.com/current' }];
+        return [];
+      }
+    });
+
+    await worker.send({ type: 'status' });
+    await settleWorker();
+    expect(worker.controlSockets).toHaveLength(1);
+    const socket = worker.controlSockets[0]!;
+    expect(socket.url).toBe('ws://127.0.0.1:8765/control');
+    socket.open();
+    await settleWorker();
+    expect(JSON.parse(socket.sent[0]!)).toMatchObject({
+      type: 'auth',
+      token: 'paired-token',
+      protocol: 9
+    });
+
+    const url = 'https://chatgpt.com/?clf=cmd-worker-1#clf=cmd-worker-1';
+    socket.receive({ type: 'open_command', id: 'cmd-worker-1', url });
+    await settleWorker();
+
+    expect(worker.tabsCreate).toHaveBeenCalledWith({
+      url,
+      active: false,
+      windowId: 4,
+      openerTabId: 12
+    });
+    expect(worker.tabsUpdate).not.toHaveBeenCalled();
+    expect(worker.windowsUpdate).not.toHaveBeenCalled();
+    expect(socket.sent.map((payload) => JSON.parse(payload))).toContainEqual(
+      expect.objectContaining({ type: 'opened', id: 'cmd-worker-1', tabId: 99 })
+    );
+  });
+
+  it('asks every ChatGPT recorder for exact request-id evidence immediately', async () => {
+    let releaseFirst!: () => void;
+    const firstReply = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsQuery: async (query = {}) =>
+        Array.isArray(query.url) ? [{ id: 21, windowId: 4 }, { id: 22, windowId: 4 }] : [],
+      tabsSendMessage: async (tabId) => {
+        if (tabId === 21) await firstReply;
+        return { ok: true };
+      }
+    });
+
+    await worker.send({ type: 'status' });
+    await settleWorker();
+    const socket = worker.controlSockets[0]!;
+    socket.open();
+    await settleWorker();
+    worker.tabsSendMessage.mockClear();
+
+    socket.receive({ type: 'scan_request', requestId: 'wfr_exact_worker_request' });
+    await settleWorker();
+
+    expect(worker.tabsSendMessage.mock.calls).toEqual([
+      [21, { type: 'clf-scan-now', requestId: 'wfr_exact_worker_request' }],
+      [22, { type: 'clf-scan-now', requestId: 'wfr_exact_worker_request' }]
+    ]);
+    releaseFirst();
+    await settleWorker();
+  });
+});
+
 function journalOf(session: FakeStorageArea): any[] {
   const value = session.data.journal;
   return Array.isArray(value) ? value : [];
@@ -684,9 +826,9 @@ describe('worker settings authority', () => {
 /**
  * The half of delivery that lives in the browser.
  *
- * The app opens the marked chat itself, so what is tested here is what the extension
- * does with a marker once a page has it, and the recovery path for commands the app
- * could not open — which is the only thing that runs while no ChatGPT page exists.
+ * The app pushes one marked URL over its authenticated control socket. The extension creates
+ * that tab inactive, then the page redeems the marker. Recovery still covers commands whose
+ * existing worker page was temporarily unable to take custody.
  */
 describe('extension command delivery', () => {
   const paired = { port: 8765, token: 'paired-token' };
@@ -744,9 +886,9 @@ describe('extension command delivery', () => {
    * fetched: a half-minute `chrome.alarms` tick pulled `GET /commands`, opened a marked tab
    * per unopened command, and persisted an `opened` list so a restarted service worker would
    * not open a second chat for the same job. Every part of that could act on a run the app
-   * had already finished with, and every part of it was a clock. The app opens the chat now,
-   * in the same transaction that creates the command, so the extension has nothing to poll
-   * and nothing to remember. The only alarm now is a delivery retry for observations and
+   * had already finished with, and every part of it was a clock. The app pushes the exact chat
+   * now, in the same transaction that creates the command, so the extension has nothing to poll
+   * and no command list to remember. The only alarm now is a delivery retry for observations and
    * close notices already accepted into durable session storage; it never discovers work
    * and never opens a tab.
    */

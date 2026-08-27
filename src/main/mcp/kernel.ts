@@ -77,6 +77,7 @@ import {
   recordToolCall
 } from '../session/recorder.js';
 import { readOverflowText } from '../session/store.js';
+import { requestBrowserCorrelationScan } from '../browser-control.js';
 import type { StoredText } from '../../shared/session.js';
 
 export interface ToolContext {
@@ -403,6 +404,14 @@ async function dispatchTracked(
   // touch state. If the page is one tick late this stays null; only handlers that actually
   // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
   context.caller.conversationId = callerConversation(name, startedAt, requestId);
+  // Hidden Pro worker tabs can publish ChatGPT's metadata.request_id after their ordinary
+  // observer cadence, which used to make `agents` wait for the full evidence deadline and
+  // still fail when that cadence landed later. Ask the authenticated extension to scan every
+  // ChatGPT page now. The page/app join remains the same exact request id; this adds urgency,
+  // not a timing fallback or a guessed active-tab identity.
+  if (name === 'agents' && !context.caller.conversationId && requestId) {
+    requestBrowserCorrelationScan(requestId);
+  }
   // Only calls that need an *existing* per-chat workspace before the handler runs are
   // identity-sensitive here. An absolute read or an exec with an explicit absolute workdir is
   // self-contained and must stay fast; if its exact page mate is late, workspace.ts simply

@@ -9,6 +9,7 @@
 
 import http from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import WebSocket, { type RawData } from 'ws';
 import { APP_VERSION, BRIDGE_PROTOCOL } from '../src/main/version.js';
 import type { ContinuationSnapshot } from '../src/main/session/continuation.js';
 import type { SwarmSnapshot } from '../src/main/agents.js';
@@ -48,6 +49,7 @@ const {
   sweepStaleSwarm,
   unpair
 } = await import('../src/main/bridge.js');
+const { requestBrowserCorrelationScan } = await import('../src/main/browser-control.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const {
   GOAL_OBJECTIVES_STATE,
@@ -251,6 +253,51 @@ async function pair(): Promise<string> {
   return token;
 }
 
+function nextControlMessage(socket: WebSocket, type: string, timeoutMs = 1500): Promise<Record<string, any>> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timed out waiting for control message ${type}`));
+    }, timeoutMs);
+    const onMessage = (raw: RawData) => {
+      let parsed: Record<string, any> | null = null;
+      try {
+        parsed = JSON.parse(raw.toString()) as Record<string, any>;
+      } catch {
+        return;
+      }
+      if (parsed.type !== type) return;
+      cleanup();
+      resolve(parsed);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error(`control socket closed before ${type}`));
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      socket.off('message', onMessage);
+      socket.off('close', onClose);
+    };
+    socket.on('message', onMessage);
+    socket.on('close', onClose);
+  });
+}
+
+async function connectControl(pairToken: string): Promise<WebSocket> {
+  const socket = new WebSocket(base.replace(/^http:/, 'ws:') + '/control', {
+    headers: { origin: EXTENSION_ORIGIN }
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once('open', resolve);
+    socket.once('error', reject);
+  });
+  const ready = nextControlMessage(socket, 'ready');
+  socket.send(JSON.stringify({ type: 'auth', token: pairToken, protocol: BRIDGE_PROTOCOL, version: APP_VERSION }));
+  await ready;
+  return socket;
+}
+
 beforeAll(async () => {
   dir = await makeTempDir('clf-bridge-');
   initConfigPath(dir);
@@ -284,8 +331,8 @@ beforeEach(async () => {
   resetBridgeForTests();
   opened.length = 0;
   anonymousRedeemIndex = 0;
-  // The app opens the chat itself, always: there is no queue for a tab to come and ask.
-  // Tests that need the open to fail replace this with their own opener.
+  // Legacy/first-connection delivery still uses the injected OS opener. Protocol-9 control
+  // tests connect a real socket and prove that path supersedes this focus-taking fallback.
   setBrowserOpener(async (url) => {
     opened.push(url);
   });
@@ -350,6 +397,67 @@ describe('who is allowed to talk to it', () => {
   it('refuses a preflight that arrives without an Origin', async () => {
     const reply = await request('OPTIONS', '/events', { origin: null, auth: null });
     expect(reply.status).toBe(403);
+  });
+});
+
+describe('authenticated real-time browser control', () => {
+  it('rejects a WebSocket upgrade made by an ordinary web page origin', async () => {
+    const socket = new WebSocket(base.replace(/^http:/, 'ws:') + '/control', {
+      headers: { origin: 'https://chatgpt.com' }
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once('open', () => reject(new Error('web origin unexpectedly opened the control socket')));
+      socket.once('unexpected-response', (_request, response) => {
+        try {
+          expect(response.statusCode).toBe(403);
+          response.resume();
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+      socket.once('error', () => undefined);
+    });
+  });
+
+  it('rejects a local WebSocket client that does not know the paired extension token', async () => {
+    await pair();
+    const socket = new WebSocket(base.replace(/^http:/, 'ws:') + '/control', {
+      headers: { origin: EXTENSION_ORIGIN }
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once('open', resolve);
+      socket.once('error', reject);
+    });
+    const refused = nextControlMessage(socket, 'error');
+    socket.send(JSON.stringify({ type: 'auth', token: 'wrong-token', protocol: BRIDGE_PROTOCOL, version: APP_VERSION }));
+    await expect(refused).resolves.toMatchObject({ type: 'error', error: 'unauthorised' });
+    await new Promise<void>((resolve) => {
+      if (socket.readyState === WebSocket.CLOSED) resolve();
+      else socket.once('close', () => resolve());
+    });
+  });
+
+  it('sends exact request-id scan requests only over an authenticated control socket', async () => {
+    const socket = await connectControl(await pair());
+    const scan = nextControlMessage(socket, 'scan_request');
+
+    expect(requestBrowserCorrelationScan('wfr_exact_worker_request')).toBe(true);
+    await expect(scan).resolves.toEqual({ type: 'scan_request', requestId: 'wfr_exact_worker_request' });
+    socket.close();
+  });
+
+  it('hands a new worker URL to the extension instead of the focus-stealing OS opener', async () => {
+    const socket = await connectControl(await pair());
+    const opening = nextControlMessage(socket, 'open_command');
+
+    spawn({ workers: [{ task: 'open behind the current tab' }], caller: { conversationId: PRIME_CHAT } });
+
+    const command = await opening;
+    expect(command).toMatchObject({ type: 'open_command' });
+    expect(new URL(command.url).searchParams.get('clf')).toBe(command.id);
+    expect(opened).toEqual([]);
+    socket.close();
   });
 });
 

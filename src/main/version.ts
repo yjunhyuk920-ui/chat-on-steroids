@@ -47,5 +47,8 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
  *     `disconnected`, protected routes distinguish that revocation from a stale token, and
  *     /pair accepts `reconnect: true` only for an explicit browser-side reconnect. An older
  *     extension would otherwise silently undo the user's app-side Disconnect on its next 401.
+ * 9 — the paired extension gains an authenticated loopback control socket. The app can ask it
+ *     to create a marked worker tab inactive and can trigger an immediate exact request-id scan
+ *     in open ChatGPT pages; HTTP remains the durable command/evidence path.
  */
-export const BRIDGE_PROTOCOL = 8;
+export const BRIDGE_PROTOCOL = 9;

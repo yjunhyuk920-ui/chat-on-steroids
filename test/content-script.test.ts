@@ -5186,6 +5186,42 @@ describe('evidence from the page context', () => {
 
   const reply = replyFiber;
 
+  it('runs a Fiber evidence scan immediately when the app requests an exact request id', async () => {
+    live = await harness('https://chatgpt.com/');
+    const window = live.window as any;
+    const instant = window.setTimeout;
+    window.setTimeout = (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms);
+    let scans = 0;
+    const onAsk = (event: any) => {
+      if (!event.data || event.data.source !== 'clf-fiber-ask') return;
+      scans += 1;
+      window.dispatchEvent(
+        new window.MessageEvent('message', {
+          data: {
+            source: 'clf-fiber-reply',
+            nonce: event.data.nonce,
+            scanToken: event.data.nonce,
+            v: 10,
+            scanOk: true,
+            rows: [],
+            turns: []
+          },
+          source: window
+        })
+      );
+    };
+    window.addEventListener('message', onAsk);
+    try {
+      await expect(
+        live.runtimeMessage({ type: 'clf-scan-now', requestId: 'wfr_exact_worker_request' })
+      ).resolves.toMatchObject({ ok: true, requestId: 'wfr_exact_worker_request' });
+      expect(scans).toBe(1);
+    } finally {
+      window.removeEventListener('message', onAsk);
+      window.setTimeout = instant;
+    }
+  });
+
   it('reads a well-formed descriptor', async () => {
     live = await harness();
     expect(live.hook.readDescriptor(GOOD)).toMatchObject({
