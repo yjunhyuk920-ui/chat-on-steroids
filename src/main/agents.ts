@@ -82,13 +82,65 @@
  * mid-task: it only decides what the end of that task means.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AgentInfo, AgentMessage, AgentState, SwarmState } from '../shared/session.js';
 import { getConfig } from './config.js';
 import { logInfo, logWarn } from './logger.js';
 import { inheritWorkspace, releasePrimeWorkspace } from './workspace.js';
 
 export const PRIME_ID = 'prime';
+
+/**
+ * A validated `agents` operation whose exact page owner may arrive after its MCP result.
+ *
+ * The payload contains no authority. `requestId` is joined later to browser evidence, and
+ * `conversationId` is written only by that exact join. Keeping this intent in the broker's
+ * own snapshot lets the eventual domain mutation and its idempotency receipt cross one
+ * durable barrier together instead of trying to coordinate two state files after a crash.
+ */
+export type DeferredAgentActionInput =
+  | {
+      action: 'spawn';
+      context: string | null;
+      workers: Array<{ label?: string; task: string }>;
+    }
+  | {
+      action: 'message';
+      messages: Array<{ to: string; text: string }>;
+    }
+  | { action: 'finish'; result: string }
+  | { action: 'status' };
+
+export interface DeferredAgentActionOutcome {
+  text: string;
+  structuredContent?: Record<string, unknown>;
+  isError?: boolean;
+}
+
+export type DeferredAgentActionStatus = 'pending' | 'completed' | 'failed' | 'cancelled';
+
+export interface DeferredAgentActionRecord {
+  id: string;
+  requestId: string;
+  fingerprint: string;
+  input: DeferredAgentActionInput;
+  createdAt: number;
+  expiresAt: number;
+  conversationId: string | null;
+  status: DeferredAgentActionStatus;
+  outcome: DeferredAgentActionOutcome | null;
+  completedAt: number | null;
+  /** At-least-once delivery state for outcomes completed after the original MCP response. */
+  offeredAt: number | null;
+  offers: number;
+  ackedAt: number | null;
+}
+
+/** Pending evidence is allowed to outlive a model/tool timeout, but never forever. */
+export const DEFERRED_AGENT_ACTION_TTL_MS = 30 * 60_000;
+/** Completed receipts remain long enough to make late ChatGPT retries idempotent. */
+const DEFERRED_AGENT_RECEIPT_TTL_MS = 24 * 60 * 60_000;
+const MAX_DEFERRED_AGENT_ACTIONS = 256;
 
 /**
  * Unacknowledged messages held per agent before the broker pushes back.
@@ -405,6 +457,24 @@ interface FinishStageState {
 }
 const activeFinishStages = new Map<Agent, FinishStageState>();
 
+/**
+ * Durable late-attribution intents and their receipts.
+ *
+ * `unpublishedDeferredActions` hides a newly accepted intent from the ordinary debounced
+ * snapshot until its immediate acceptance write succeeds. `activeDeferredActionStages`
+ * similarly projects a completion only into the same critical snapshot that contains the
+ * staged spawn/message/finish mutation. A restart therefore sees either pending+no effect or
+ * completed+effect, never the split state that would duplicate a worker on replay.
+ */
+const deferredAgentActions = new Map<string, DeferredAgentActionRecord>();
+const unpublishedDeferredActions = new Set<string>();
+interface DeferredActionStageState {
+  id: string;
+  next: DeferredAgentActionRecord;
+  settled: boolean;
+}
+const activeDeferredActionStages = new Map<string, DeferredActionStageState>();
+
 // ------------------------------------------------------------------ listeners
 
 export function onSwarmChange(listener: () => void): () => void {
@@ -468,6 +538,299 @@ export async function persistCriticalSwarmNow(): Promise<boolean> {
     });
   }
   return criticalPersistFlight;
+}
+
+function stableActionJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableActionJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableActionJson(object[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function copyDeferredAction(record: DeferredAgentActionRecord): DeferredAgentActionRecord {
+  return {
+    ...record,
+    input: JSON.parse(JSON.stringify(record.input)) as DeferredAgentActionInput,
+    outcome: record.outcome
+      ? {
+          ...record.outcome,
+          structuredContent: record.outcome.structuredContent
+            ? (JSON.parse(JSON.stringify(record.outcome.structuredContent)) as Record<string, unknown>)
+            : undefined
+        }
+      : null
+  };
+}
+
+function deferredActionIdentity(requestId: string, input: DeferredAgentActionInput): { id: string; fingerprint: string } {
+  const fingerprint = createHash('sha256').update(stableActionJson(input)).digest('hex');
+  const id = createHash('sha256').update(`${requestId}\0${fingerprint}`).digest('hex');
+  return { id, fingerprint };
+}
+
+function pruneDeferredActionReceipts(now = Date.now()): void {
+  const terminal = [...deferredAgentActions.values()]
+    .filter(
+      (record) =>
+        record.status !== 'pending' &&
+        record.completedAt !== null &&
+        // An exact conversation's late outcome is retained until a later authenticated call
+        // acknowledges it. Queue pressure refuses new actions instead of silently deleting an
+        // unacknowledged result, but an abandoned chat cannot reserve the global queue forever:
+        // after the documented receipt TTL the idempotency/delivery receipt is allowed to age
+        // out even if no acknowledgement ever came back.
+        (record.ackedAt !== null ||
+          record.conversationId === null ||
+          now - record.completedAt > DEFERRED_AGENT_RECEIPT_TTL_MS)
+    )
+    .sort((left, right) => (left.completedAt ?? 0) - (right.completedAt ?? 0));
+  for (const record of terminal) {
+    if (
+      deferredAgentActions.size <= MAX_DEFERRED_AGENT_ACTIONS &&
+      now - (record.completedAt ?? now) <= DEFERRED_AGENT_RECEIPT_TTL_MS
+    ) {
+      continue;
+    }
+    deferredAgentActions.delete(record.id);
+    unpublishedDeferredActions.delete(record.id);
+    activeDeferredActionStages.delete(record.id);
+  }
+}
+
+export interface StagedDeferredAgentAction {
+  record: DeferredAgentActionRecord;
+  created: boolean;
+  /** Publishes a newly pending action only after its immediate durable acceptance write. */
+  commitPending: () => void;
+  /** Removes an action whose immediate durable acceptance failed. */
+  rollback: () => void;
+}
+
+/**
+ * Stages one validated action under a semantic idempotency key.
+ *
+ * ChatGPT reuses one request id for several connector calls in a turn, so the request id alone
+ * is not an action id. The canonical payload fingerprint distinguishes spawn/status/message,
+ * while an identical retry receives the same record and can never create a second side effect.
+ */
+export function stageDeferredAgentAction(
+  requestId: string,
+  input: DeferredAgentActionInput,
+  now = Date.now()
+): StagedDeferredAgentAction {
+  if (!requestId || requestId.length > 200) throw new AgentError('The agents request id is missing or invalid.');
+  pruneDeferredActionReceipts(now);
+  const identity = deferredActionIdentity(requestId, input);
+  const existing = deferredAgentActions.get(identity.id);
+  if (existing) {
+    return {
+      record: copyDeferredAction(existing),
+      created: false,
+      commitPending: () => undefined,
+      rollback: () => undefined
+    };
+  }
+  if (deferredAgentActions.size >= MAX_DEFERRED_AGENT_ACTIONS) {
+    throw new AgentError(
+      'AGENT_ACTION_QUEUE_FULL: too many late-attribution agent actions are still retained. Wait for browser evidence or clear the swarm.'
+    );
+  }
+  const record: DeferredAgentActionRecord = {
+    ...identity,
+    requestId,
+    input: JSON.parse(JSON.stringify(input)) as DeferredAgentActionInput,
+    createdAt: now,
+    expiresAt: now + DEFERRED_AGENT_ACTION_TTL_MS,
+    conversationId: null,
+    status: 'pending',
+    outcome: null,
+    completedAt: null,
+    offeredAt: null,
+    offers: 0,
+    ackedAt: null
+  };
+  deferredAgentActions.set(record.id, record);
+  unpublishedDeferredActions.add(record.id);
+  changed();
+  let settled = false;
+  return {
+    record: copyDeferredAction(record),
+    created: true,
+    commitPending: () => {
+      if (settled) return;
+      settled = true;
+      unpublishedDeferredActions.delete(record.id);
+      changed('telemetry');
+    },
+    rollback: () => {
+      if (settled) return;
+      settled = true;
+      unpublishedDeferredActions.delete(record.id);
+      if (deferredAgentActions.get(record.id) === record) deferredAgentActions.delete(record.id);
+      // Supersede a failed immediate write generation with the safe pre-acceptance snapshot.
+      changed();
+    }
+  };
+}
+
+export interface StagedDeferredAgentActionOutcome {
+  record: DeferredAgentActionRecord;
+  repeat: boolean;
+  commit: () => void;
+  rollback: () => void;
+}
+
+/** Projects a terminal receipt into the same critical snapshot as its broker mutation. */
+export function stageDeferredAgentActionOutcome(
+  id: string,
+  conversationId: string | null,
+  status: Exclude<DeferredAgentActionStatus, 'pending'>,
+  outcome: DeferredAgentActionOutcome,
+  now = Date.now(),
+  offeredInCurrentCall = false
+): StagedDeferredAgentActionOutcome {
+  const current = deferredAgentActions.get(id);
+  if (!current) throw new AgentError('The deferred agents action no longer exists.');
+  if (current.status !== 'pending') {
+    return {
+      record: copyDeferredAction(current),
+      repeat: true,
+      commit: () => undefined,
+      rollback: () => undefined
+    };
+  }
+  if (activeDeferredActionStages.has(id)) {
+    throw new AgentError('AGENT_ACTION_IN_PROGRESS: this exact deferred action is already being committed.');
+  }
+  if (current.conversationId && conversationId && current.conversationId !== conversationId) {
+    throw new AgentError('The deferred agents action received contradictory conversation ownership.');
+  }
+  const next: DeferredAgentActionRecord = {
+    ...current,
+    conversationId: conversationId ?? current.conversationId,
+    status,
+    outcome: {
+      ...outcome,
+      structuredContent: outcome.structuredContent
+        ? (JSON.parse(JSON.stringify(outcome.structuredContent)) as Record<string, unknown>)
+        : undefined
+    },
+    completedAt: now,
+    offeredAt: offeredInCurrentCall ? now : current.offeredAt,
+    offers: offeredInCurrentCall ? Math.max(1, current.offers) : current.offers,
+    ackedAt: current.ackedAt
+  };
+  const stage: DeferredActionStageState = { id, next, settled: false };
+  activeDeferredActionStages.set(id, stage);
+  changed();
+  const settle = (accepted: boolean): void => {
+    if (stage.settled) return;
+    stage.settled = true;
+    if (activeDeferredActionStages.get(id) === stage) activeDeferredActionStages.delete(id);
+    if (accepted) {
+      deferredAgentActions.set(id, next);
+      unpublishedDeferredActions.delete(id);
+      pruneDeferredActionReceipts(now);
+      changed('telemetry');
+      return;
+    }
+    // The projected receipt may be the newest failed durable generation. Publish the pending
+    // side again so retry recovery can never mistake an uncommitted outcome for acceptance.
+    changed();
+  };
+  return {
+    record: copyDeferredAction(next),
+    repeat: false,
+    commit: () => settle(true),
+    rollback: () => settle(false)
+  };
+}
+
+export function deferredAgentAction(
+  requestId: string,
+  input: DeferredAgentActionInput
+): DeferredAgentActionRecord | null {
+  const { id } = deferredActionIdentity(requestId, input);
+  const record = deferredAgentActions.get(id);
+  return record ? copyDeferredAction(record) : null;
+}
+
+export function deferredAgentActionsForRequest(requestId: string): DeferredAgentActionRecord[] {
+  return [...deferredAgentActions.values()]
+    .filter((record) => record.requestId === requestId)
+    .map(copyDeferredAction);
+}
+
+export function pendingDeferredAgentActions(): DeferredAgentActionRecord[] {
+  return [...deferredAgentActions.values()]
+    .filter((record) => record.status === 'pending')
+    .map(copyDeferredAction);
+}
+
+/** Delayed receipts ride on the next authenticated result for their exact conversation. */
+export function offerDeferredAgentActionOutcomes(
+  conversationId: string | null | undefined,
+  excludeId: string | null = null
+): DeferredAgentActionRecord[] {
+  if (!conversationId) return [];
+  const offered: DeferredAgentActionRecord[] = [];
+  const now = Date.now();
+  for (const record of deferredAgentActions.values()) {
+    if (
+      record.id === excludeId ||
+      record.conversationId !== conversationId ||
+      record.status === 'pending' ||
+      !record.outcome ||
+      record.ackedAt !== null
+    ) {
+      continue;
+    }
+    record.offeredAt = now;
+    record.offers += 1;
+    offered.push(copyDeferredAction(record));
+  }
+  if (offered.length > 0) changed('telemetry');
+  return offered;
+}
+
+/** Marks a receipt that is being returned directly by an identical agents retry. */
+export function noteDeferredAgentActionOutcomeOffered(id: string): void {
+  const record = deferredAgentActions.get(id);
+  if (!record || record.status === 'pending' || !record.outcome || record.ackedAt !== null) return;
+  if (record.offeredAt === null) {
+    record.offeredAt = Date.now();
+    record.offers = Math.max(1, record.offers);
+    changed('telemetry');
+  }
+}
+
+/** A later authenticated call is evidence that previously offered delayed outcomes arrived. */
+export function acknowledgeDeferredAgentActionOutcomes(
+  conversationId: string | null | undefined,
+  callStartedAt: number
+): DeferredAgentActionRecord[] {
+  if (!conversationId) return [];
+  const acknowledged: DeferredAgentActionRecord[] = [];
+  const now = Date.now();
+  for (const record of deferredAgentActions.values()) {
+    if (
+      record.conversationId !== conversationId ||
+      record.ackedAt !== null ||
+      record.offeredAt === null ||
+      record.offeredAt >= callStartedAt
+    ) {
+      continue;
+    }
+    record.ackedAt = now;
+    acknowledged.push(copyDeferredAction(record));
+  }
+  if (acknowledged.length > 0) changed('telemetry');
+  return acknowledged;
 }
 
 export function onRetiredWorkersPersist(handler: (() => void) | null): void {
@@ -3550,12 +3913,12 @@ interface DormantRunSnapshot {
 
 export interface SwarmSnapshot {
   /**
-   * 5 = one optional active incarnation plus every durable dormant prime-owned history.
-   * Version 4 is accepted on restore and migrated as a single active incarnation; versions
-   * before 4 are discarded because their worker identity depended on routing codes this build
-   * cannot honour.
+   * 6 = version 5 plus late-attribution action intents/receipts in the same atomic snapshot.
+   * Version 4 is accepted on restore and migrated as a single active incarnation; versions 5
+   * and 6 keep dormant histories. Versions before 4 are discarded because their worker
+   * identity depended on routing codes this build cannot honour.
    */
-  version: 4 | 5;
+  version: 4 | 5 | 6;
   savedAt: number;
   /** Top-level fields are the active incarnation; all are null/empty while only history remains. */
   runId: string | null;
@@ -3563,6 +3926,7 @@ export interface SwarmSnapshot {
   startedAt: number | null;
   agents: SerializedAgent[];
   dormantRuns?: DormantRunSnapshot[];
+  deferredActions?: DeferredAgentActionRecord[];
 }
 
 export function snapshotSwarm(): SwarmSnapshot | null {
@@ -3585,9 +3949,16 @@ function snapshotSwarmIncludingUnpublished(): SwarmSnapshot | null {
 function buildSwarmSnapshot(includeUnpublished: boolean): SwarmSnapshot | null {
   const active = run && (includeUnpublished || unpublishedRun !== run) ? run : null;
   const dormant = [...dormantRuns.values()];
-  if (!active && dormant.length === 0) return null;
+  pruneDeferredActionReceipts();
+  const deferredActions = [...deferredAgentActions.values()]
+    .filter((record) => includeUnpublished || !unpublishedDeferredActions.has(record.id))
+    .map((record) => {
+      const staged = includeUnpublished ? activeDeferredActionStages.get(record.id) : null;
+      return copyDeferredAction(staged && !staged.settled ? staged.next : record);
+    });
+  if (!active && dormant.length === 0 && deferredActions.length === 0) return null;
   return {
-    version: 5,
+    version: 6,
     savedAt: Date.now(),
     runId: active?.runId ?? null,
     primeConversationId: active?.primeConversationId ?? null,
@@ -3601,7 +3972,8 @@ function buildSwarmSnapshot(includeUnpublished: boolean): SwarmSnapshot | null {
       // belong to this exact agent map after it moves from `run` to dormant history, so the
       // immediate snapshot must carry them; ordinary/debounced snapshots must still hide them.
       agents: serializeAgents(history.agents, includeUnpublished)
-    }))
+    })),
+    deferredActions
   };
 }
 
@@ -3654,6 +4026,105 @@ function serializeAgents(agents: Map<string, Agent>, includeUnpublished: boolean
     });
 }
 
+function validDeferredInput(value: unknown): value is DeferredAgentActionInput {
+  if (!value || typeof value !== 'object') return false;
+  const input = value as Record<string, unknown>;
+  if (input.action === 'status') return Object.keys(input).length === 1;
+  if (input.action === 'finish') {
+    return typeof input.result === 'string' && input.result.length > 0 && input.result.length <= MAX_MESSAGE_CHARS;
+  }
+  if (input.action === 'message') {
+    return (
+      Array.isArray(input.messages) &&
+      input.messages.length > 0 &&
+      input.messages.length <= MAX_BATCH_MESSAGES &&
+      input.messages.every(
+        (message) =>
+          message &&
+          typeof message === 'object' &&
+          typeof (message as { to?: unknown }).to === 'string' &&
+          (message as { to: string }).to.length > 0 &&
+          (message as { to: string }).to.length <= 40 &&
+          typeof (message as { text?: unknown }).text === 'string' &&
+          (message as { text: string }).text.length > 0 &&
+          (message as { text: string }).text.length <= MAX_MESSAGE_CHARS
+      )
+    );
+  }
+  if (
+    input.action !== 'spawn' ||
+    !Array.isArray(input.workers) ||
+    input.workers.length === 0 ||
+    input.workers.length > 8
+  ) {
+    return false;
+  }
+  if (input.context !== null && (typeof input.context !== 'string' || input.context.length > MAX_CONTEXT_CHARS)) return false;
+  return input.workers.every(
+    (worker) =>
+      worker &&
+      typeof worker === 'object' &&
+      typeof (worker as { task?: unknown }).task === 'string' &&
+      (worker as { task: string }).task.length > 0 &&
+      (worker as { task: string }).task.length <= MAX_TASK_CHARS &&
+      ((worker as { label?: unknown }).label === undefined ||
+        (typeof (worker as { label?: unknown }).label === 'string' &&
+          ((worker as { label: string }).label.length <= MAX_LABEL_CHARS)))
+  );
+}
+
+function validDeferredOutcome(value: unknown): value is DeferredAgentActionOutcome {
+  if (!value || typeof value !== 'object') return false;
+  const outcome = value as DeferredAgentActionOutcome;
+  return (
+    typeof outcome.text === 'string' &&
+    outcome.text.length <= 64_000 &&
+    (outcome.structuredContent === undefined ||
+      (outcome.structuredContent !== null && typeof outcome.structuredContent === 'object')) &&
+    (outcome.isError === undefined || typeof outcome.isError === 'boolean')
+  );
+}
+
+function validDeferredRecord(value: unknown): value is DeferredAgentActionRecord {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Partial<DeferredAgentActionRecord>;
+  if (
+    typeof record.requestId !== 'string' ||
+    !record.requestId ||
+    record.requestId.length > 200 ||
+    !validDeferredInput(record.input) ||
+    typeof record.createdAt !== 'number' ||
+    !Number.isFinite(record.createdAt) ||
+    typeof record.expiresAt !== 'number' ||
+    !Number.isFinite(record.expiresAt) ||
+    (record.conversationId !== null && typeof record.conversationId !== 'string') ||
+    !['pending', 'completed', 'failed', 'cancelled'].includes(record.status ?? '')
+  ) {
+    return false;
+  }
+  const identity = deferredActionIdentity(record.requestId, record.input);
+  if (record.id !== identity.id || record.fingerprint !== identity.fingerprint) return false;
+  if (record.status === 'pending') {
+    return (
+      record.outcome === null &&
+      record.completedAt === null &&
+      record.offeredAt === null &&
+      record.offers === 0 &&
+      record.ackedAt === null
+    );
+  }
+  return (
+    validDeferredOutcome(record.outcome) &&
+    typeof record.completedAt === 'number' &&
+    Number.isFinite(record.completedAt) &&
+    (record.offeredAt === null || (typeof record.offeredAt === 'number' && Number.isFinite(record.offeredAt))) &&
+    typeof record.offers === 'number' &&
+    Number.isSafeInteger(record.offers) &&
+    record.offers >= 0 &&
+    (record.ackedAt === null || (typeof record.ackedAt === 'number' && Number.isFinite(record.ackedAt)))
+  );
+}
+
 /**
  * Restores a run from disk.
  *
@@ -3670,15 +4141,28 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
   unpublishedRun = null;
   activeSpawnStage = null;
   activeFinishStages.clear();
+  deferredAgentActions.clear();
+  unpublishedDeferredActions.clear();
+  activeDeferredActionStages.clear();
   criticalMutationRevision = 0;
   persistedCriticalRevision = 0;
   criticalPersistFlight = null;
   if (!snapshot || !Array.isArray(snapshot.agents)) return;
-  if (snapshot.version !== 4 && snapshot.version !== 5) {
+  if (snapshot.version !== 4 && snapshot.version !== 5 && snapshot.version !== 6) {
     logInfo('multi-agent: discarded a run saved by an older build — spawn again to start a new one.');
     return;
   }
   let repaired = false;
+  if (snapshot.version === 6 && Array.isArray(snapshot.deferredActions)) {
+    for (const saved of snapshot.deferredActions.slice(-MAX_DEFERRED_AGENT_ACTIONS)) {
+      if (!validDeferredRecord(saved) || deferredAgentActions.has(saved.id)) {
+        repaired = true;
+        continue;
+      }
+      deferredAgentActions.set(saved.id, copyDeferredAction(saved));
+    }
+    pruneDeferredActionReceipts();
+  }
   const occupiedConversations = new Set<string>();
 
   const acceptOwner = (primeConversationId: string, agents: Map<string, Agent>): boolean => {
@@ -3695,7 +4179,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
     return true;
   };
 
-  if (snapshot.version === 5 && Array.isArray(snapshot.dormantRuns)) {
+  if ((snapshot.version === 5 || snapshot.version === 6) && Array.isArray(snapshot.dormantRuns)) {
     for (const saved of snapshot.dormantRuns) {
       if (!saved || typeof saved.primeConversationId !== 'string' || !saved.primeConversationId || !Array.isArray(saved.agents)) {
         repaired = true;
@@ -3859,6 +4343,9 @@ export function resetAgentsForTests(): void {
   unpublishedRun = null;
   activeSpawnStage = null;
   activeFinishStages.clear();
+  deferredAgentActions.clear();
+  unpublishedDeferredActions.clear();
+  activeDeferredActionStages.clear();
   retiredWorkers.clear();
   livenessFloor = 0;
   spawnRequest = null;

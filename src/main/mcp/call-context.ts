@@ -84,6 +84,8 @@ export interface CallContext {
    * still running and reports it on its own tick, which is usually after the answer.
    */
   bindOnAttribution?: string;
+  /** Deferred agents receipt already present in this call's direct result; do not append it twice. */
+  deferredAgentActionId?: string;
 }
 
 const storage = new AsyncLocalStorage<CallContext>();

@@ -57,6 +57,7 @@ import {
 } from './window-lifecycle.js';
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
+import { startDeferredAgentActionEngine, stopDeferredAgentActionEngine } from './mcp/agent-actions.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -300,6 +301,10 @@ void app.whenReady().then(async () => {
   if (windowActivation.isDisabled()) return;
   await restoreContinuations(savedContinuations);
   if (windowActivation.isDisabled()) return;
+  // Late request-id evidence can release an agents action accepted by an earlier process.
+  // Start only after correlation, swarm and continuation ownership are all restored, so the
+  // first replay sees the complete authority state. The scan pump itself waits for the bridge.
+  startDeferredAgentActionEngine();
 
   // Strict CSP for our own page. There is no remote content and no inline script.
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
@@ -389,11 +394,14 @@ app.on('will-quit', (event) => {
 
   void runShutdownSequence(
     [
-      // Phase 1: stop both listeners from admitting work and let accepted requests drain.
-      // The budget has to clear the drains it contains, or it would silently defeat them:
-      // the bridge force-closes wedged localhost sockets at 15s and the MCP endpoint forces
-      // its own drain at 30s. This is the outer bound on both, not a competing one.
-      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge()] },
+      // Stop MCP admission first. A request already inside agents may still create a durable
+      // late-attribution resolver, so drain those HTTP handlers before freezing that engine.
+      { name: 'MCP admission/drain', budgetMs: 35_000, run: () => [shutdownConnection()] },
+      // No new agents actions can now be admitted. Unsubscribe correlation wakes and finish any
+      // resolver already crossing its broker barrier while the browser bridge is still alive.
+      { name: 'deferred agent drain', budgetMs: 10_000, run: () => [stopDeferredAgentActionEngine()] },
+      // Only then may the evidence/browser-command bridge stop accepting and drain its sockets.
+      { name: 'bridge admission/drain', budgetMs: 20_000, run: () => [shutdownBridge()] },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {
         name: 'process cleanup',

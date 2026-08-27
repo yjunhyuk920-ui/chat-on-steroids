@@ -26,7 +26,7 @@ import {
   ViewImageError,
   viewImage
 } from '../codex/view-image.js';
-import { logInfo, logWarn } from '../logger.js';
+import { logInfo } from '../logger.js';
 import { SandboxError, isNativeWindowsPath, resolvePath, strayVirtualPath } from '../sandbox.js';
 import { currentWorkspace } from '../workspace.js';
 import type { Capabilities, Root } from '../../shared/types.js';
@@ -96,22 +96,7 @@ import {
 import { childEnv } from '../exec.js';
 import { locateRipgrep } from '../ripgrep.js';
 import { ensureDevToolchain } from '../toolchain.js';
-import {
-  agentForCaller,
-  noteAgentContextTokens,
-  persistCriticalSwarmNow,
-  PRIME_ID,
-  requestWorkerBootstraps,
-  requestWorkerRevivals,
-  statusForCaller,
-  stageFinishAgent,
-  stageMessages,
-  stageSpawn,
-  swarmRunning,
-  swarmStateForCaller,
-  type Caller
-} from '../agents.js';
-import { repairPrimeFromResumeShadow } from '../session/continuation.js';
+import { swarmRunning, type DeferredAgentActionInput } from '../agents.js';
 import {
   currentCall,
   currentCaller,
@@ -120,20 +105,13 @@ import {
   noteDetail,
   noteExec
 } from './call-context.js';
+import { awaitFreshCallOrigin } from '../session/recorder.js';
 import {
-  awaitFreshCallOrigin,
-  recordAgentMessage
-} from '../session/recorder.js';
-import { findSessionByConversation } from '../session/store.js';
-import {
-  adoptAgent,
   fail,
   formatFileInfo,
   friendlyError,
   guard,
   IDENTITY_EVIDENCE_MS,
-  PRIME_EVIDENCE_MS,
-  SPAWN_EVIDENCE_MS,
   ok,
   pathArg,
   lineNumberArg,
@@ -142,6 +120,7 @@ import {
   type SurfaceRegistrar,
   type ToolResult
 } from './kernel.js';
+import { handleAgentAction } from './agent-actions.js';
 import { registerSessionTool as registerSessionSearchReadTool } from './session-tool.js';
 
 /** Entries one `read` of a directory returns before it says it stopped. */
@@ -925,38 +904,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
  * act on and is kept to a sentence or two; ids, states and counts are machine state and belong
  * in a shape the caller can read without parsing English.
  */
-/**
- * Re-measures how full each sleeping worker's chat is, before the prime may wake one.
- *
- * The context ceiling is what makes a stop final, and it is measured from the app's own
- * durable session for that conversation rather than from anything a model reported. The
- * broker keeps the figure in memory and in its snapshot, but a chat that grew while this app
- * was not running — or one whose snapshot predates the measurement entirely — would otherwise
- * be woken into a conversation with no room left in it. Reading it here, on the one call that
- * can wake a worker, is what makes the ceiling survive a crash rather than a restart quietly
- * handing back a worker the prime was already told was finished.
- */
-async function measureSleepingWorkers(caller: Caller): Promise<void> {
-  for (const info of swarmStateForCaller(caller).agents) {
-    if (info.role !== 'worker' || info.state !== 'sleeping' || !info.conversationId) continue;
-    const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
-    if (summary) noteAgentContextTokens(info.conversationId, summary.contextTokens);
-  }
-  // Measurement is usually telemetry, but crossing the worker ceiling revokes durable revival
-  // authority and can terminalize a parked worker. `status` also calls this helper, so there is
-  // no later message/spawn acceptance barrier we can rely on: make every critical revision seen
-  // through the end of measurement durable before publishing the resulting state to the model.
-  try {
-    if (!(await persistCriticalSwarmNow())) {
-      throw new Error('the broker has no immediate durable persistence sink');
-    }
-  } catch (error) {
-    throw new Error(
-      `Worker context/revival state could not cross its durable barrier. Retry the agents call. (${error instanceof Error ? error.message : String(error)})`
-    );
-  }
-}
-
 function registerAgentsTool(reg: SurfaceRegistrar): void {
   reg.register(
     'agents',
@@ -1041,332 +988,39 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
       .strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
     },
-    async (input) => {
-      // One clock for one MCP call. The dispatcher owns startedAt and the recorder later uses
-      // that exact value to consume any page request reserved while proving caller identity.
-      // Taking a second Date.now() here made callerNow reserve evidence under one timestamp
-      // and recordToolCall look for it under another, leaving the first request permanently
-      // reserved until TTL and breaking the very next worker control call.
-      const startedAt = currentCall()?.startedAt ?? Date.now();
-      return guard('agents', async () => {
+    async (input) =>
+      guard('agents', async () => {
         if (!reg.agentToolsLive) return reg.featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
 
+        let action: DeferredAgentActionInput;
         if (input.action === 'spawn') {
           if (!input.workers) return fail('agents action=spawn requires workers.');
-          // One atomic operation: it either claims this exact conversation as prime and
-          // creates the workers, or it creates nothing at all. There is no "create the
-          // workers and find out who the prime was later" — that ordering is what produced a
-          // run whose workers could talk to a prime nobody could authenticate as.
-          //
-          // And the identity behind it is the exact kind: a generic connector row would let
-          // an uninvolved chat that happened to call something else in the same window
-          // become the prime of this run.
-          const staged = stageSpawn({
-            workers: input.workers,
+          action = {
+            action: 'spawn',
             context: input.context ?? null,
-            caller: await callerNow(startedAt, { exact: true })
-          });
-          let accepted = false;
-          try {
-            let durable = false;
-            try {
-              durable = await persistCriticalSwarmNow();
-            } catch (error) {
-              throw new Error(
-                `The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request. (${error instanceof Error ? error.message : String(error)})`
-              );
-            }
-            if (!durable) {
-              throw new Error(
-                'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.'
-              );
-            }
-            staged.commit();
-            accepted = true;
-          } catch (error) {
-            if (!accepted) staged.rollback();
-            throw error;
-          }
-          const { created, becamePrime, runId } = staged;
-          // Browser tabs are a publication side effect, never part of planning. They become
-          // visible only after the exact broker revision above is durable.
-          requestWorkerBootstraps(created.map((worker) => worker.id));
-          await adoptAgent(PRIME_ID);
-          const invited = created.filter((worker) => worker.state === 'invited');
-          const sleeping = created.filter((worker) => worker.state === 'sleeping' && worker.revivable);
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text:
-                  (becamePrime ? `This conversation is now the prime agent of run ${runId}. ` : '') +
-                  `${created.length} worker(s) matched: ${created.map((info) => `${info.id} (${info.label}, ${info.state})`).join(', ')}. ` +
-                  (invited.length > 0 ? 'New worker chats are opening with their briefs already in them. ' : '') +
-                  (sleeping.length > 0
-                    ? `${sleeping.map((worker) => worker.id).join(', ')} already finished that earlier piece and is sleeping in its existing chat; wake it with action=message instead of spawning a duplicate. `
-                    : '') +
-                  'Carry on with your own work — results and ' +
-                  'messages arrive at the end of later tool results, so there is nothing to wait for and never anything ' +
-                  'to poll. A short correction with action=message while a worker is still going is far cheaper than ' +
-                  'the alternative.'
-              }
-            ],
-            structuredContent: {
-              action: 'spawn',
-              run_id: runId,
-              self: PRIME_ID,
-              became_prime: becamePrime,
-              workers: created.map((info) => ({ id: info.id, label: info.label, state: info.state }))
-            }
+            workers: input.workers.map((worker) => ({
+              ...(worker.label === undefined ? {} : { label: worker.label }),
+              task: worker.task
+            }))
           };
-        }
-
-        if (input.action === 'message') {
-          // Two spellings of one operation. A single message is the common case and stays a
-          // pair of scalars; `messages` is the same thing in bulk. Both in one call is a
-          // request whose intended order nobody can read, so it is refused rather than
-          // guessed at.
+        } else if (input.action === 'message') {
           const batch = input.messages ?? [];
           const single = input.to && input.text ? [{ to: input.to, text: input.text }] : [];
           if (batch.length > 0 && single.length > 0) {
             return fail('agents action=message takes either to+text or messages, not both.');
           }
-          const items = batch.length > 0 ? batch : single;
-          if (items.length === 0) return fail('agents action=message requires to and text, or a messages array.');
-          // Before any slot is reserved: a sleeping worker whose chat has since crossed the
-          // context ceiling is not revivable, and this is the call that would otherwise wake it.
-          const caller = await callerNow(startedAt);
-          await measureSleepingWorkers(caller);
-          // One call, one identity resolution, one all-or-nothing delivery: a prime
-          // redirecting its whole run cannot end up with two of its three messages sent.
-          const staged = stageMessages(caller, items);
-          let accepted = false;
-          try {
-            let durable = false;
-            try {
-              durable = await persistCriticalSwarmNow();
-            } catch (error) {
-              throw new Error(
-                `The agent message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request. (${error instanceof Error ? error.message : String(error)})`
-              );
-            }
-            if (!durable) {
-              throw new Error('The agent message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request.');
-            }
-            staged.commit();
-            accepted = true;
-          } catch (error) {
-            if (!accepted) staged.rollback();
-            throw error;
-          }
-          const sent = staged.messages;
-          const woken = staged.waking;
-          // Reopening a sleeping worker's chat is a browser side effect, so it happens only
-          // after the broker revision that reserved its slot is durable — exactly as a spawn's
-          // tabs do. Nothing has been typed into that chat yet at this point.
-          if (woken.length > 0) requestWorkerRevivals(woken);
-          for (const message of sent) await recordAgentMessage(message, 'sent');
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text:
-                  `Queued for ${sent.map((message) => message.to).join(', ')}. ` +
-                  (woken.length > 0
-                    ? `${woken.join(', ')} ${woken.length === 1 ? 'was' : 'were'} asleep and ${woken.length === 1 ? 'is' : 'are'} ` +
-                      'being woken in the same chat, with everything already known there still in it; your message is ' +
-                      'the next thing it reads. '
-                    : '') +
-                  'Carry on with the work — a reply, if there is one, arrives at the end of a later tool result.'
-              }
-            ],
-            structuredContent: {
-              action: 'message',
-              queued: sent.map((message) => ({ id: message.id, to: message.to })),
-              waking: woken
-            }
-          };
-        }
-
-        if (input.action === 'finish') {
+          const messages = batch.length > 0 ? batch : single;
+          if (messages.length === 0) return fail('agents action=message requires to and text, or a messages array.');
+          action = { action: 'message', messages: messages.map((message) => ({ ...message })) };
+        } else if (input.action === 'finish') {
           if (!input.result) return fail('agents action=finish requires result.');
-          const staged = stageFinishAgent(await callerNow(startedAt), input.result);
-          let accepted = staged.repeat;
-          try {
-            if (!staged.repeat) {
-              let durable = false;
-              try {
-                durable = await persistCriticalSwarmNow();
-              } catch (error) {
-                throw new Error(
-                  `The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result. (${error instanceof Error ? error.message : String(error)})`
-                );
-              }
-              if (!durable) {
-                throw new Error(
-                  'The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result.'
-                );
-              }
-              staged.commit();
-              accepted = true;
-            }
-          } catch (error) {
-            if (!accepted) staged.rollback();
-            throw error;
-          }
-          const { info, report, repeat } = staged;
-          if (report) await recordAgentMessage(report, 'sent');
-          // A retry is answered as a retry. Repeating "marked finished" would read as a
-          // second finish and invite the model to keep going until it gets a different
-          // answer, which is how one lost result became a queue of identical reports.
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: repeat
-                  ? `${info.id} was already ${info.state} and the prime agent already has that result, so nothing was ` +
-                    'sent again. Stop working and stop calling tools.'
-                  : info.state === 'finished'
-                    ? `${info.id} is finished. The prime agent has your result. This chat has also reached its context ` +
-                      'limit, so there will be no more work in it: stop working and stop calling tools.'
-                    : `${info.id} reported and is now asleep. The prime agent has your result and your worker slot is ` +
-                      'free. Stop working and stop calling tools; if the prime has more for you it will say so here in ' +
-                      'this same chat, and you pick up from what you already know.'
-              }
-            ],
-            structuredContent: { action: 'finish', self: info.id, state: info.state, repeat }
-          };
+          action = { action: 'finish', result: input.result };
+        } else {
+          action = { action: 'status' };
         }
-
-        // status. Read-only, and deliberately small: it is the run as its own members see it,
-        // and `identify` is what decides whether this caller is one of them. An unrelated
-        // chat is told AGENTS_BUSY and nothing else — not who the prime is, not how many
-        // workers there are, not what any of them are doing.
-        const caller = await callerNow(startedAt);
-        await measureSleepingWorkers(caller);
-        const status = statusForCaller(caller);
-        const me = status.self;
-        const state = status.state;
-        const failed = state.agents.filter((info) => info.state === 'failed');
-        // The word the model reads here is the whole answer to "may I use this worker again".
-        // A sleeping worker is not a spent one, and calling it finished in this table is what
-        // sends a prime off to spawn a fourth chat for work its first worker already knows the
-        // background to.
-        const shown = (info: { state: string; revivable: boolean }): string =>
-          info.state === 'sleeping'
-            ? info.revivable
-              ? 'sleeping (reported; waiting for new instructions)'
-              : 'sleeping'
-            : info.state === 'waking'
-              ? 'waking (your message is being delivered to its chat)'
-              : info.state;
-        const asleep = state.agents.filter((info) => info.state === 'sleeping' && info.revivable);
-        const slots = status.freeWorkerSlots;
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text:
-                `You are ${me.id}.\n` +
-                state.agents
-                  .map(
-                    (info) =>
-                      `${info.id}  ${info.role}  ${shown(info)}  waiting ${info.pending}  ${info.label}` +
-                      (info.result
-                        ? `\n    ${info.state === 'failed' ? 'failure' : info.state === 'finished' ? 'result' : 'latest result'}: ${info.result.slice(0, 300)}`
-                        : '')
-                  )
-                  .join('\n') +
-                (me.id === PRIME_ID
-                  ? `\n\n${slots} of your worker slots ${slots === 1 ? 'is' : 'are'} free.` +
-                    (asleep.length > 0
-                      ? ` ${asleep.map((info) => info.id).join(', ')} ${asleep.length === 1 ? 'is' : 'are'} asleep and ` +
-                        'can be woken with agents action=message, in the chat they already have and with everything ' +
-                        'they learned there still in it. Prefer that to action=spawn' +
-                        (slots === 0 ? ', once a slot frees up.' : '.')
-                      : '')
-                  : '') +
-                // Said in words as well as in the table: a failed worker will not report, and
-                // waiting for it is the mistake this line prevents.
-                (failed.length > 0
-                  ? `\n\n${failed.map((info) => info.id).join(', ')} will not report. Do that work yourself or wake ` +
-                    'another worker; do not wait for them.'
-                  : '')
-            }
-          ],
-          structuredContent: {
-            action: 'status',
-            run_id: status.runId,
-            self: me.id,
-            free_worker_slots: slots,
-            agents: state.agents.map((info) => ({
-              id: info.id,
-              role: info.role,
-              label: info.label,
-              state: info.state,
-              revivable: info.revivable,
-              waiting: info.pending,
-              result: info.result ?? null
-            }))
-          }
-        };
-      });
-    }
+        return handleAgentAction(action);
+      })
   );
-}
-
-/**
- * Who is making this `agents` call, established for this call alone.
- *
- * The prime holds no credential by design, and the dispatcher deliberately hands ordinary
- * tool calls no authority from "the only chat that has been active lately" — that is not
- * proof that the chat made this call, and stale page state once authenticated prime calls as
- * worker-1. So identity is proven here per call by joining ChatGPT's inbound MCP HTTP
- * `x-request-id` to the same request id reported from one concrete conversation's message
- * model. The page evidence may arrive just before or just after the MCP request; the id, not
- * timing, is the join. If its exact mate never appears, the broker refuses the operation.
- * Missing request-id evidence never falls back to a visible row, active/generating chat,
- * agent key, or recent browser state.
- *
- * The proven identity is then adopted for the rest of the call, so this result is recorded
- * against the right agent and carries the right inbox.
- */
-async function callerNow(startedAt: number, options: { exact?: boolean } = {}): Promise<Caller> {
-  const base = currentCaller();
-  // `exact` marks the one action that binds a run: spawn. It is the call whose refusal the
-  // model cannot absorb, so it gets the longer ceiling; every other `agents` action can be
-  // declined and asked again on the next tool call.
-  const window = base.requestId ? (options.exact ? SPAWN_EVIDENCE_MS : IDENTITY_EVIDENCE_MS) : PRIME_EVIDENCE_MS;
-  const resolved =
-    base.conversationId ??
-    (await awaitFreshCallOrigin('agents', startedAt, window, {
-      ...options,
-      // ChatGPT's own id for this request, when it sent one. It names the conversation
-      // outright, so two workers calling at the same moment are no longer a hard case.
-      requestId: base.requestId
-    }));
-  const caller: Caller = {
-    ...base,
-    conversationId: resolved
-  };
-  if (resolved) {
-    const call = currentCall();
-    if (call) call.caller.conversationId = resolved;
-    // A pre-fix Compact & Resume can leave this exact app-opened replacement chat with its own
-    // shadow session while the reusable-worker run is still bound to the source chat. Repair
-    // only that durably-proven historical failure before membership is evaluated; unrelated
-    // conversations still hit AGENTS_BUSY exactly as before.
-    await repairPrimeFromResumeShadow(resolved);
-  }
-  if (!resolved) {
-    logWarn(
-      base.requestId
-        ? `agents caller not identified: no page evidence matched HTTP request ${base.requestId.slice(0, 20)}…`
-        : 'agents caller not identified: this MCP request carried no request id and page evidence was insufficient'
-    );
-  }
-  await adoptAgent(agentForCaller(caller));
-  return caller;
 }
 
 // ---------------------------------------------------------------------------

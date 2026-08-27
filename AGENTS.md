@@ -476,6 +476,15 @@ kernel.ts/recorder.ts did the call wait for, find and use the exact proof?
 
 Agent routing is *downstream* of this. Do not start there.
 
+An `agents` request may reach MCP before ChatGPT publishes its matching page request id. The
+handler never guesses and does not hold the HTTP call behind a larger fixed timeout: it stores
+the validated semantic action in the swarm snapshot, returns `PENDING_IDENTITY`, and an
+Electron-owned scan pump keeps asking the extension for that exact id. A later exact correlation
+commits the action and its idempotency receipt in the same critical swarm snapshot; contradictory
+evidence, expiry, or missing evidence produces no side effect. Identical retries are keyed by
+request id **plus canonical action payload**, because one ChatGPT workflow id can name several
+tool calls in order.
+
 **Tests.** `correlation.test.ts`, `mcp-inbound.test.ts`, `fiber.test.ts`,
 `content-script.test.ts`, `swarm.test.ts`.
 
@@ -612,6 +621,13 @@ routing credential** — established from the same evidence as recorder attribut
 secret token rides in model arguments and **sender identity never comes from a model
 argument**. There is no credential and no recovery action: a worker whose binding was lost
 is rebound by the extension reporting its chat, never by something a model can present.
+
+Late attribution is a durable broker state, not a longer sleep. A pending spawn/message/finish
+is inert until exact request-id evidence names its conversation. The eventual mutation and
+terminal receipt share one immediate snapshot, so restart recovery sees pending+no effect or
+completed+effect. Outcomes completed after the original MCP response are offered at least once
+on that conversation's next authenticated tool result; pending actions expire after their bounded
+authority window, and conflicting ownership cancels them permanently.
 
 **Messaging is at-least-once until acknowledged**: queued durably → offered on a tool result
 → acknowledged by the next authenticated tool call. Offering on a result is **not** proof

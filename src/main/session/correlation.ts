@@ -51,6 +51,10 @@ const CORRELATIONS_STATE_VERSION = 3;
 
 const byRequest = new Map<string, HeldCorrelation>();
 const waiters = new Map<string, Set<() => void>>();
+export type RequestCorrelationObservation = 'resolved' | 'conflict';
+const observationListeners = new Set<
+  (requestId: string, observation: RequestCorrelationObservation, correlation: RequestCorrelation | null) => void
+>();
 let restored = false;
 let restoring: Promise<void> | null = null;
 
@@ -267,7 +271,33 @@ export function observeRequestCorrelations(
     return result;
   });
   if (changed) persist();
+  // Ownership can become knowable after the MCP response which first carried this id. Notify
+  // durable consumers from the correlation event itself; they still receive only the exact
+  // registry verdict, never timing/active-tab/page heuristics. One batch commonly contains
+  // several tool rows from the same workflow id, so wake each id once.
+  for (const requestId of new Set(inputs.map((input) => input.requestId))) {
+    const correlation = requestCorrelation(requestId);
+    const observation: RequestCorrelationObservation = requestCorrelationConflicted(requestId)
+      ? 'conflict'
+      : 'resolved';
+    for (const listener of observationListeners) {
+      try {
+        listener(requestId, observation, correlation);
+      } catch {
+        // Evidence storage is authoritative and synchronous. A downstream wake-up failure may
+        // be retried from its own durable state, but must never reject or roll back this proof.
+      }
+    }
+  }
   return results;
+}
+
+/** Process-lifetime subscription for durable work released by exact page ownership evidence. */
+export function onRequestCorrelationObservation(
+  listener: (requestId: string, observation: RequestCorrelationObservation, correlation: RequestCorrelation | null) => void
+): () => void {
+  observationListeners.add(listener);
+  return () => observationListeners.delete(listener);
 }
 
 /** Exact request-id lookup. A contradiction and an absent request both resolve to null. */

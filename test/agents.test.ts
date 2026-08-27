@@ -36,6 +36,9 @@ const {
   clearAgent,
   claimWorkerRevival,
   currentRunId,
+  DEFERRED_AGENT_ACTION_TTL_MS,
+  deferredAgentAction,
+  deferredAgentActionsForRequest,
   dormantWorkerNotice,
   failAgent,
   finishAgent,
@@ -74,6 +77,7 @@ const {
   sendMessage,
   stageQueuedWorkerRevivals,
   stageFinishAgent,
+  stageDeferredAgentAction,
   stageWorkerConversationFinish,
   stageMessages,
   stageSpawn,
@@ -86,6 +90,7 @@ const {
   workerConversationGone,
   workerRevivalClaimed
 } = await import('../src/main/agents.js');
+const { startDeferredAgentActionEngine } = await import('../src/main/mcp/agent-actions.js');
 const { startMcpServer } = await import('../src/main/mcp/server.js');
 const { runningToolCalls } = await import('../src/main/mcp/call-context.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
@@ -995,7 +1000,7 @@ describe('a worker that is sleeping', () => {
     expect(releaseQuiescentRun()).toBe(true);
 
     const saved = snapshotSwarm()!;
-    expect(saved.version).toBe(5);
+    expect(saved.version).toBe(6);
     expect(saved.runId).toBeNull();
     expect(saved.dormantRuns).toHaveLength(2);
 
@@ -1844,7 +1849,16 @@ describe('through the MCP endpoint', () => {
         calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false, requestId }]
       }
     ]);
-    return (await pending).result?.structuredContent ?? {};
+    let reply = await pending;
+    if (reply.result?.structuredContent?.pending_identity === true) {
+      await vi.waitFor(
+        () =>
+          expect(deferredAgentActionsForRequest(requestId).every((record) => record.status !== 'pending')).toBe(true),
+        { timeout: 5_000 }
+      );
+      reply = await replyWithRequestId(requestId, action, args);
+    }
+    return reply.result?.structuredContent ?? {};
   };
 
   /**
@@ -1870,7 +1884,16 @@ describe('through the MCP endpoint', () => {
         calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false, requestId }]
       }
     ]);
-    return pending;
+    let text = await pending;
+    if (/PENDING_IDENTITY/i.test(text)) {
+      await vi.waitFor(
+        () =>
+          expect(deferredAgentActionsForRequest(requestId).every((record) => record.status !== 'pending')).toBe(true),
+        { timeout: 5_000 }
+      );
+      text = await agentsWithRequestId(requestId, action, args);
+    }
+    return text;
 
   };
 
@@ -1931,6 +1954,215 @@ describe('through the MCP endpoint', () => {
     const scansAtCompletion = browserControlMocks.requestBrowserCorrelationScan.mock.calls.length;
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     expect(browserControlMocks.requestBrowserCorrelationScan).toHaveBeenCalledTimes(scansAtCompletion);
+  });
+
+  it('defers an unidentified spawn, then commits it once when exact evidence arrives later', async () => {
+    const requestId = 'wfr_agents_deferred_spawn';
+    const reply = replyWithRequestId(requestId, 'spawn', { workers: [{ task: 'inspect the parser' }] });
+    const fast = await Promise.race([
+      reply.then((value) => ({ kind: 'reply' as const, value })),
+      new Promise<{ kind: 'timeout'; value: null }>((resolve) =>
+        setTimeout(() => resolve({ kind: 'timeout', value: null }), 800)
+      )
+    ]);
+
+    // Let the old blocking implementation finish cleanly before failing this regression. This
+    // avoids leaving an in-flight MCP request behind to hold endpoint shutdown for 30 seconds.
+    if (fast.kind === 'timeout') {
+      await recordChatObservations(PRIME_CHAT, [
+        { kind: 'turn_start', time: Date.now(), turnId: 't-deferred-spawn-old-cleanup' },
+        {
+          kind: 'tool_evidence',
+          time: Date.now(),
+          turnId: 't-deferred-spawn-old-cleanup',
+          calls: [{ messageId: 'm-deferred-spawn-old-cleanup', tool: 'agents', order: 0, answered: false, requestId }]
+        }
+      ]);
+      await reply;
+    }
+
+    expect(fast.kind).toBe('reply');
+    if (fast.kind !== 'reply') return;
+    expect(textOfReply(fast.value)).toMatch(/PENDING_IDENTITY/i);
+    expect(swarmRunning()).toBe(false);
+    expect(pendingWorkerSpawns()).toEqual([]);
+
+    // Correlation is an event, not a deadline. It may arrive after the original MCP response;
+    // only this exact request id is allowed to release the staged action.
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-deferred-spawn' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-deferred-spawn',
+        calls: [{ messageId: 'm-deferred-spawn', tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+    await vi.waitFor(() => expect(pendingWorkerSpawns().map((worker) => worker.id)).toEqual(['worker-1']));
+
+    // ChatGPT reused the same workflow id for retries in the live failure. A repeated identical
+    // call receives the durable receipt and must not open a second worker.
+    const repeated = await agentsWithRequestId(requestId, 'spawn', { workers: [{ task: 'inspect the parser' }] });
+    expect(repeated).toMatch(/worker-1/i);
+    expect(pendingWorkerSpawns().map((worker) => worker.id)).toEqual(['worker-1']);
+  });
+
+  it('keeps different actions under one ChatGPT workflow id distinct and commits them in order', async () => {
+    const requestId = 'wfr_agents_shared_workflow';
+    const spawnReply = await agentsWithRequestId(requestId, 'spawn', {
+      workers: [{ task: 'inspect the request parser' }]
+    });
+    expect(spawnReply).toMatch(/PENDING_IDENTITY/i);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const statusReply = await agentsWithRequestId(requestId, 'status');
+    expect(statusReply).toMatch(/PENDING_IDENTITY/i);
+
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-shared-workflow' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-shared-workflow',
+        calls: [{ messageId: 'm-shared-workflow', tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+
+    await vi.waitFor(() => expect(pendingWorkerSpawns().map((worker) => worker.id)).toEqual(['worker-1']));
+    const repeatedStatus = await agentsWithRequestId(requestId, 'status');
+    expect(repeatedStatus).toContain('You are prime');
+    expect(pendingWorkerSpawns().map((worker) => worker.id)).toEqual(['worker-1']);
+  });
+
+  it('cancels a deferred action on contradictory conversation evidence and executes nothing', async () => {
+    const requestId = 'wfr_agents_conflicted_owner';
+    for (const [index, conversationId] of ['c-conflict-a', 'c-conflict-b'].entries()) {
+      await recordChatObservations(conversationId, [
+        { kind: 'turn_start', time: Date.now(), turnId: `t-conflict-${index}` },
+        {
+          kind: 'tool_evidence',
+          time: Date.now(),
+          turnId: `t-conflict-${index}`,
+          calls: [{ messageId: `m-conflict-${index}`, tool: 'agents', order: 0, answered: false, requestId }]
+        }
+      ]);
+    }
+
+    const text = await agentsWithRequestId(requestId, 'spawn', { workers: [{ task: 'must never open' }] });
+    expect(text).toMatch(/CANCELLED|contradictory/i);
+    expect(swarmRunning()).toBe(false);
+    expect(pendingWorkerSpawns()).toEqual([]);
+  });
+
+  it('restores a pending action after restart and commits it from later exact evidence', async () => {
+    const requestId = 'wfr_agents_restart_pending';
+    const input = {
+      action: 'spawn' as const,
+      context: null,
+      workers: [{ task: 'survive the app restart' }]
+    };
+    const accepted = stageDeferredAgentAction(requestId, input);
+    expect(await persistCriticalSwarmNow()).toBe(true);
+    accepted.commitPending();
+    const saved = snapshotSwarm()!;
+    expect(saved.deferredActions?.find((record) => record.requestId === requestId)?.status).toBe('pending');
+
+    resetAgentsForTests();
+    onSwarmPersistNow(async () => undefined);
+    restoreSwarm(saved);
+    startDeferredAgentActionEngine();
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-restart-pending' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-restart-pending',
+        calls: [{ messageId: 'm-restart-pending', tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+
+    await vi.waitFor(() => expect(pendingWorkerSpawns().map((worker) => worker.id)).toEqual(['worker-1']));
+    expect(deferredAgentAction(requestId, input)?.status).toBe('completed');
+  });
+
+  it('delivers a late action outcome on the next authenticated result and acknowledges it once', async () => {
+    const requestId = 'wfr_agents_late_outcome';
+    expect(
+      await agentsWithRequestId(requestId, 'spawn', { workers: [{ task: 'produce a delayed receipt' }] })
+    ).toMatch(/PENDING_IDENTITY/i);
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-late-outcome' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-late-outcome',
+        calls: [{ messageId: 'm-late-outcome', tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+    await vi.waitFor(() => expect(pendingWorkerSpawns()).toHaveLength(1));
+
+    const first = await asChat(PRIME_CHAT, 'status');
+    expect(first).toContain('delayed agent action outcome');
+    expect(first).toContain('New worker chats are opening');
+    const second = await asChat(PRIME_CHAT, 'status');
+    expect(second).not.toContain('delayed agent action outcome');
+  });
+
+  it('expires a pending action without side effects when exact evidence arrives too late', async () => {
+    const requestId = 'wfr_agents_expired_pending';
+    const input = {
+      action: 'spawn' as const,
+      context: null,
+      workers: [{ task: 'must expire without opening' }]
+    };
+    const accepted = stageDeferredAgentAction(requestId, input, Date.now() - DEFERRED_AGENT_ACTION_TTL_MS - 1);
+    expect(await persistCriticalSwarmNow()).toBe(true);
+    accepted.commitPending();
+    startDeferredAgentActionEngine();
+
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-expired-pending' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-expired-pending',
+        calls: [{ messageId: 'm-expired-pending', tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+
+    await vi.waitFor(() => expect(deferredAgentAction(requestId, input)?.status).toBe('cancelled'));
+    expect(deferredAgentAction(requestId, input)?.outcome?.text).toMatch(/EXPIRED/i);
+    expect(swarmRunning()).toBe(false);
+    expect(pendingWorkerSpawns()).toEqual([]);
+  });
+
+  it('defers a worker finish and publishes its prime report exactly once after late evidence', async () => {
+    startSwarm(1);
+    bindConversation('worker-1', 'c-worker-1');
+    const requestId = 'wfr_agents_deferred_finish';
+    const args = { result: 'late finish result' };
+
+    const first = await agentsWithRequestId(requestId, 'finish', args);
+    expect(first).toMatch(/PENDING_IDENTITY/i);
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
+    expect(pendingCount(PRIME_ID)).toBe(0);
+
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-deferred-finish' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-deferred-finish',
+        calls: [{ messageId: 'm-deferred-finish', tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+    await vi.waitFor(() =>
+      expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')?.state).toBe('sleeping')
+    );
+    expect(offerMessagesForConversation(PRIME_CHAT)?.messages.filter((message) => message.text.includes('late finish result'))).toHaveLength(1);
+
+    const repeated = await agentsWithRequestId(requestId, 'finish', args);
+    expect(repeated).toMatch(/reported and is now asleep/i);
+    expect(offerMessagesForConversation(PRIME_CHAT)?.messages.filter((message) => message.text.includes('late finish result'))).toHaveLength(1);
   });
 
   // One flat tool with five actions. The names it replaced are gone outright, not aliased,

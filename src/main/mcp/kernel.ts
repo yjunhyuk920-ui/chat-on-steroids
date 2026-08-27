@@ -39,6 +39,7 @@ import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
 import {
   AgentError,
+  acknowledgeDeferredAgentActionOutcomes,
   acknowledgeOffers,
   acknowledgeOffersForConversation,
   dormantWorkerNotice,
@@ -51,6 +52,7 @@ import {
   hasRetiredWorkerLeases,
   offerMessages,
   offerMessagesForConversation,
+  offerDeferredAgentActionOutcomes,
   persistCriticalSwarmNow,
   requestWorkerRevivals,
   releaseQuiescentRun,
@@ -319,7 +321,8 @@ function withInbox(
   conversationId: string | null | undefined,
   agent: string | null,
   result: ToolResult,
-  onFinish = false
+  onFinish = false,
+  excludeDeferredActionId: string | null = null
 ): ToolResult {
   // Conversation ownership is the durable authority. This matters most for a parked prime:
   // there is deliberately no live `agent:prime` while another history may be active, but its
@@ -329,19 +332,37 @@ function withInbox(
   const scoped = offerMessagesForConversation(conversationId, onFinish, onFinish);
   const recipient = scoped?.agentId ?? agent;
   const messages = scoped?.messages ?? (agent ? offerMessages(agent, onFinish) : []);
-  if (messages.length === 0) return result;
-  const lines = messages
-    .map(
-      (message) =>
-        `• [${message.id}] from ${message.from}${message.offers > 1 ? ' (repeat — you may have seen this)' : ''}: ${message.text}`
-    )
-    .join('\n');
+  const deferred = offerDeferredAgentActionOutcomes(conversationId, excludeDeferredActionId);
+  if (messages.length === 0 && deferred.length === 0) return result;
+  const additions: ToolContent[] = [];
+  if (messages.length > 0) {
+    const lines = messages
+      .map(
+        (message) =>
+          `• [${message.id}] from ${message.from}${message.offers > 1 ? ' (repeat — you may have seen this)' : ''}: ${message.text}`
+      )
+      .join('\n');
+    additions.push({
+      type: 'text',
+      text: `\n--- ${messages.length} message(s) for ${recipient ?? 'this conversation'} ---\n${lines}`
+    });
+  }
+  if (deferred.length > 0) {
+    const lines = deferred
+      .map(
+        (action) =>
+          `• [${action.id.slice(0, 12)}] ${action.input.action} ${action.status}` +
+          `${action.offers > 1 ? ' (repeat — you may have seen this)' : ''}: ${action.outcome?.text ?? ''}`
+      )
+      .join('\n');
+    additions.push({
+      type: 'text',
+      text: `\n--- ${deferred.length} delayed agent action outcome(s) ---\n${lines}`
+    });
+  }
   return {
     ...result,
-    content: [
-      ...result.content,
-      { type: 'text', text: `\n--- ${messages.length} message(s) for ${recipient ?? 'this conversation'} ---\n${lines}` }
-    ]
+    content: [...result.content, ...additions]
   };
 }
 
@@ -381,54 +402,15 @@ async function dispatch(
     outcome: null,
     evidence: emptyEvidence()
   };
-  // A hidden Chrome tab can throttle its own one-second recorder timer, and updating only
-  // metadata.request_id in React's model need not create a DOM mutation. One forced scan at
-  // ingress therefore races the page model. Keep waking the exact scan from the Electron main
-  // process for this MCP request's lifetime, with a small exponential backoff. This is not a
-  // longer attribution timeout: the existing exact-id wait still owns the safety ceiling, and
-  // this pump stops immediately when the call resolves for any reason.
-  const stopCorrelationScan =
-    name === 'agents' && !context.caller.conversationId && requestId
-      ? keepBrowserCorrelationScanAlive(requestId, () => !context.caller.conversationId)
-      : null;
-  try {
-    return await trackMcpRequest(() =>
-      trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run))
-    );
-  } finally {
-    stopCorrelationScan?.();
-  }
-}
-
-/**
- * Wakes a hidden ChatGPT recorder while one exact identity-sensitive request is in flight.
- *
- * The schedule runs in Electron, not in the hidden tab Chrome may throttle. Backoff keeps a
- * genuinely missing extension cheap, while the first retry remains fast enough to catch the
- * normal page-model race. The returned disposer is the authority boundary: no scan outlives
- * the MCP call that asked for it.
- */
-function keepBrowserCorrelationScanAlive(requestId: string, needed: () => boolean): () => void {
-  let stopped = false;
-  let timer: NodeJS.Timeout | null = null;
-  let nextDelayMs = 250;
-  const stop = (): void => {
-    stopped = true;
-    if (timer) clearTimeout(timer);
-    timer = null;
-  };
-  const scan = (): void => {
-    if (stopped || !needed()) {
-      stop();
-      return;
-    }
+  // Wake the page model once at ingress. If this call has to become a durable pending agents
+  // action, agent-actions.ts takes ownership of the continuing Electron-side scan pump after
+  // the MCP response returns; an in-request timer is no longer the correctness boundary.
+  if (name === 'agents' && !context.caller.conversationId && requestId) {
     requestBrowserCorrelationScan(requestId);
-    timer = setTimeout(scan, nextDelayMs);
-    timer.unref?.();
-    nextDelayMs = Math.min(nextDelayMs * 2, 2_000);
-  };
-  scan();
-  return stop;
+  }
+  return trackMcpRequest(() =>
+    trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run))
+  );
 }
 
 async function dispatchTracked(
@@ -598,6 +580,7 @@ async function dispatchTracked(
     // while Prime B is active could file the delivery into B's `prime` session (or Unattributed).
     await recordAgentMessage(message, 'delivered', context.caller.conversationId);
   }
+  acknowledgeDeferredAgentActionOutcomes(context.caller.conversationId, startedAt);
   // This is the MCP call's wall-clock latency. A managed child can outlive the call, and
   // its own lifetime is process evidence; letting that number overwrite ToolCallRecord's
   // duration is what made a 10s yield read like a command that had completed in 10s.
@@ -605,7 +588,13 @@ async function dispatchTracked(
   // Inbox messages are part of the MCP result ChatGPT actually receives. Build the delivered
   // result before recording so session(action=read, tool_call=T…) is genuine wire forensics rather than a
   // subtly earlier internal value that omits the worker report most likely to matter later.
-  const delivered = withInbox(context.caller.conversationId, context.agent, result, isFinish);
+  const delivered = withInbox(
+    context.caller.conversationId,
+    context.agent,
+    result,
+    isFinish,
+    context.deferredAgentActionId ?? null
+  );
   const recorderStartedAt = Date.now();
   const recording = recordToolCall({
     tool: name,
