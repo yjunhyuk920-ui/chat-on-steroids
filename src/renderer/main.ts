@@ -13,6 +13,7 @@
  */
 
 import type { AppApi, SettingsPatch } from '../preload/index.js';
+import './i18n-ko.js';
 import { requiresApprovedFilesystemRoot } from '../shared/capabilities.js';
 import type { AppState, Capability, LogEntry, SurfaceStatus } from '../shared/types.js';
 import {

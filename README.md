@@ -7,6 +7,7 @@
     <a href="../../releases/latest"><strong>Download</strong></a>
     · <a href="#three-minute-setup">Setup</a>
     · <a href="#permissions-and-security-boundaries">Security</a>
+    · <a href="README_KO.md">한국어 안내</a>
     · <a href="CHANGELOG.md">Changelog</a>
   </p>
 </div>

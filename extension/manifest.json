@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Chat On Steroids companion",
+  "name": "__MSG_extensionName__",
   "version": "2.0.2",
-  "description": "Records your ChatGPT session into the local Chat On Steroids app and labels its MCP tool calls with what they actually did.",
+  "description": "__MSG_extensionDescription__",
+  "default_locale": "ko",
   "minimum_chrome_version": "116",
   "permissions": ["storage", "scripting", "alarms"],
   "host_permissions": [
@@ -21,7 +22,7 @@
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["chatgpt-dom.js", "content.js"],
+      "js": ["chatgpt-dom.js", "i18n-ko.js", "content.js"],
       "css": ["overlay.css"],
       "run_at": "document_idle"
     },

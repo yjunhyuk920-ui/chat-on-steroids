@@ -1,0 +1,8 @@
+{
+  "extensionName": {
+    "message": "Chat On Steroids 도우미"
+  },
+  "extensionDescription": {
+    "message": "ChatGPT 세션을 로컬 Chat On Steroids 앱에 기록하고 MCP 도구 호출이 실제로 수행한 작업을 표시합니다."
+  }
+}

@@ -24,6 +24,9 @@
 (() => {
   'use strict';
 
+  /** Translate only UI strings at the final render boundary; data and prompts stay exact. */
+  const ui = (value) => globalThis.CLF_KO?.t(String(value ?? '')) ?? String(value ?? '');
+
   // Static content scripts are not re-run in an already-open tab when an unpacked
   // extension is reloaded/updated. background.js deliberately re-injects this file into
   // those tabs from runtime.onInstalled. The normal static injection can race that recovery
@@ -5500,7 +5503,7 @@
     cancel.type = 'button';
     cancel.className = 'clf-cancel';
     cancel.textContent = '×';
-    cancel.setAttribute('aria-label', 'Cancel Compact & resume');
+    cancel.setAttribute('aria-label', ui('Cancel Compact & resume'));
     pill.append(spinner, text, cancel);
 
     const button = document.createElement('button');
@@ -5607,7 +5610,7 @@
     root.className = 'clf-menu';
     root.dataset.clfMenu = '1';
     root.setAttribute('role', 'dialog');
-    root.setAttribute('aria-label', 'Chat On Steroids settings');
+    root.setAttribute('aria-label', ui('Chat On Steroids settings'));
     root.hidden = true;
     (document.body || document.documentElement).append(root);
     return root;
@@ -5869,10 +5872,10 @@
       label.className = 'clf-menu-label';
       const name = document.createElement('span');
       name.className = 'clf-menu-name';
-      name.textContent = row.label;
+      name.textContent = ui(row.label);
       const note = document.createElement('span');
       note.className = 'clf-menu-note';
-      note.textContent = row.note;
+      note.textContent = ui(row.note);
       if (row.warn) note.dataset.clfWarn = '1';
       label.append(name, note);
 
@@ -5893,9 +5896,9 @@
     const act = document.createElement('button');
     act.type = 'button';
     act.className = 'clf-menu-action';
-    act.textContent = view.action.label;
+    act.textContent = ui(view.action.label);
     act.disabled = view.action.action === 'none' || menuBusy;
-    if (view.action.hint) act.setAttribute('data-clf-tip', view.action.hint);
+    if (view.action.hint) act.setAttribute('data-clf-tip', ui(view.action.hint));
     act.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -5937,7 +5940,7 @@
     if (!objective.available) {
       const why = document.createElement('span');
       why.className = 'clf-menu-goal-note';
-      why.textContent = objective.unavailable;
+      why.textContent = ui(objective.unavailable);
       box.append(why);
       return box;
     }
@@ -5953,13 +5956,13 @@
       link.type = 'button';
       link.className = 'clf-menu-goal-link';
       link.disabled = objectiveBusy || menuBusy;
-      link.setAttribute('data-clf-tip', objective.hint);
+      link.setAttribute('data-clf-tip', ui(objective.hint));
       const plus = document.createElement('span');
       plus.className = 'clf-menu-goal-plus';
       plus.textContent = objective.summary ? '✎' : '+';
       plus.setAttribute('aria-hidden', 'true');
       const word = document.createElement('span');
-      word.textContent = objectiveBusy ? 'working…' : objectiveError || objective.label;
+      word.textContent = ui(objectiveBusy ? 'working…' : objectiveError || objective.label);
       if (objectiveError) word.dataset.clfWarn = '1';
       link.append(word, plus);
       link.addEventListener('click', (event) => {
@@ -5976,7 +5979,7 @@
     input.dataset.clfGoalInput = '1';
     input.rows = 3;
     input.maxLength = MAX_OBJECTIVE_CHARS;
-    input.placeholder = 'What does this chat have to reach?';
+    input.placeholder = ui('What does this chat have to reach?');
     input.value = menuDraft;
     input.disabled = objectiveBusy;
     input.addEventListener('keydown', (event) => {
@@ -5994,7 +5997,7 @@
     const save = document.createElement('button');
     save.type = 'button';
     save.className = 'clf-menu-goal-save';
-    save.textContent = objectiveBusy ? 'Saving…' : 'Save';
+    save.textContent = ui(objectiveBusy ? 'Saving…' : 'Save');
     save.disabled = objectiveBusy || !menuDraft.trim();
     save.addEventListener('click', (event) => {
       event.preventDefault();
@@ -6004,7 +6007,7 @@
     const cancel = document.createElement('button');
     cancel.type = 'button';
     cancel.className = 'clf-menu-goal-cancel';
-    cancel.textContent = 'Cancel';
+    cancel.textContent = ui('Cancel');
     cancel.disabled = objectiveBusy;
     cancel.addEventListener('click', (event) => {
       event.preventDefault();
@@ -6022,7 +6025,7 @@
       const clear = document.createElement('button');
       clear.type = 'button';
       clear.className = 'clf-menu-goal-clear';
-      clear.textContent = 'Clear';
+      clear.textContent = ui('Clear');
       clear.disabled = objectiveBusy;
       clear.addEventListener('click', (event) => {
         event.preventDefault();
@@ -6097,7 +6100,7 @@
     // Never disabled any more: it opens a sheet, and a sheet that explains why compaction is
     // unavailable is exactly what somebody clicking a dead button wanted to be told.
     control.button.disabled = false;
-    control.button.setAttribute('aria-label', 'Chat On Steroids settings');
+    control.button.setAttribute('aria-label', ui('Chat On Steroids settings'));
     control.button.setAttribute('aria-haspopup', 'dialog');
     if (!control.button.hasAttribute('aria-expanded')) control.button.setAttribute('aria-expanded', 'false');
     // The meter only while the button is a button. During a run the control is saying what
@@ -6118,7 +6121,7 @@
         : state.hint
           ? `${state.label} — ${state.hint}`
           : state.label;
-    control.button.setAttribute('data-clf-tip', meter ? `${tip}\n${meter.tip}` : tip);
+    control.button.setAttribute('data-clf-tip', ui(meter ? `${tip}\n${meter.tip}` : tip));
     if (menuOpen) renderMenu();
     control.pill.hidden = state.mode === 'idle' && !state.hint;
     control.cancel.hidden = state.action !== 'cancel';
@@ -6128,7 +6131,7 @@
     //
     // The one exception is a failure, where the identifying detail *is* the message and a
     // one-word "Failed" would send the reader hunting for a tooltip to find out why.
-    const shown = state.mode === 'error' && state.hint ? state.hint : state.label;
+    const shown = ui(state.mode === 'error' && state.hint ? state.hint : state.label);
     if (control.text.textContent !== shown) control.text.textContent = shown;
   }
 
@@ -6161,10 +6164,11 @@
     box.className = 'clf-boot';
     const head = document.createElement('summary');
     head.className = 'clf-boot-head';
-    head.textContent =
+    head.textContent = ui(
       bootstrap === 'worker'
         ? 'The instruction this app gave the worker — not something you typed'
-        : 'The handoff brief this app carried over — not something you typed';
+        : 'The handoff brief this app carried over — not something you typed'
+    );
     box.append(head);
 
     node.dataset.clfBootstrap = bootstrap;
@@ -6349,8 +6353,8 @@
     close.className = 'clf-stage-close';
     close.type = 'button';
     close.textContent = '×';
-    close.title = 'Dismiss';
-    close.setAttribute('aria-label', 'Dismiss Goal status');
+    close.title = ui('Dismiss');
+    close.setAttribute('aria-label', ui('Dismiss Goal status'));
     close.hidden = true;
     close.addEventListener('click', () => {
       // Removing the node alone is not enough: injectStage runs on every activity repaint
@@ -6403,7 +6407,7 @@
         track.className = 'clf-stage-track';
         const label = document.createElement('div');
         label.className = 'clf-stage-name';
-        label.textContent = name;
+        label.textContent = ui(name);
         step.append(track, label);
         host.append(step);
       }
@@ -6493,8 +6497,10 @@
       stagePanel.root.style.maxWidth = 'none';
     }
 
-    if (stagePanel.title.textContent !== view.stage) stagePanel.title.textContent = view.stage;
-    if (stagePanel.detail.textContent !== view.detail) stagePanel.detail.textContent = view.detail;
+    const stageTitle = ui(view.stage);
+    const stageDetail = ui(view.detail);
+    if (stagePanel.title.textContent !== stageTitle) stagePanel.title.textContent = stageTitle;
+    if (stagePanel.detail.textContent !== stageDetail) stagePanel.detail.textContent = stageDetail;
     stagePanel.dismissKey = dismissKey;
     stagePanel.close.hidden = dismissKey === '';
     stagePanel.root.dataset.clfStageKind = view.kind;
