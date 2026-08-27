@@ -370,17 +370,65 @@ async function dispatch(
   // recorded, and while its result is on the way back — and a handoff written in any of
   // those gaps describes a machine that has not finished changing. The counter therefore
   // opens with the request and closes with it.
+  const startedAt = Date.now();
   const context: CallContext = {
-    startedAt: Date.now(),
+    startedAt,
     transportKey,
     agent: null,
-    caller: { transportKey, requestId, conversationId: null },
+    // Cheap, non-blocking ingress identity. When the page has already reported this exact
+    // request id, no browser wake-up is needed at all.
+    caller: { transportKey, requestId, conversationId: callerConversation(name, startedAt, requestId) },
     outcome: null,
     evidence: emptyEvidence()
   };
-  return trackMcpRequest(() =>
-    trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run))
-  );
+  // A hidden Chrome tab can throttle its own one-second recorder timer, and updating only
+  // metadata.request_id in React's model need not create a DOM mutation. One forced scan at
+  // ingress therefore races the page model. Keep waking the exact scan from the Electron main
+  // process for this MCP request's lifetime, with a small exponential backoff. This is not a
+  // longer attribution timeout: the existing exact-id wait still owns the safety ceiling, and
+  // this pump stops immediately when the call resolves for any reason.
+  const stopCorrelationScan =
+    name === 'agents' && !context.caller.conversationId && requestId
+      ? keepBrowserCorrelationScanAlive(requestId, () => !context.caller.conversationId)
+      : null;
+  try {
+    return await trackMcpRequest(() =>
+      trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run))
+    );
+  } finally {
+    stopCorrelationScan?.();
+  }
+}
+
+/**
+ * Wakes a hidden ChatGPT recorder while one exact identity-sensitive request is in flight.
+ *
+ * The schedule runs in Electron, not in the hidden tab Chrome may throttle. Backoff keeps a
+ * genuinely missing extension cheap, while the first retry remains fast enough to catch the
+ * normal page-model race. The returned disposer is the authority boundary: no scan outlives
+ * the MCP call that asked for it.
+ */
+function keepBrowserCorrelationScanAlive(requestId: string, needed: () => boolean): () => void {
+  let stopped = false;
+  let timer: NodeJS.Timeout | null = null;
+  let nextDelayMs = 250;
+  const stop = (): void => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
+  const scan = (): void => {
+    if (stopped || !needed()) {
+      stop();
+      return;
+    }
+    requestBrowserCorrelationScan(requestId);
+    timer = setTimeout(scan, nextDelayMs);
+    timer.unref?.();
+    nextDelayMs = Math.min(nextDelayMs * 2, 2_000);
+  };
+  scan();
+  return stop;
 }
 
 async function dispatchTracked(
@@ -399,19 +447,6 @@ async function dispatchTracked(
   surfaceToolCallAt.set(surface, Date.now());
   const isFinish = isFinishCall(name, args);
   const startedAt = context.startedAt;
-  // Cheap, non-blocking ingress identity. When the page has already reported this exact
-  // request id, identity-sensitive handlers (workspace/session/agents) see it before they
-  // touch state. If the page is one tick late this stays null; only handlers that actually
-  // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
-  context.caller.conversationId = callerConversation(name, startedAt, requestId);
-  // Hidden Pro worker tabs can publish ChatGPT's metadata.request_id after their ordinary
-  // observer cadence, which used to make `agents` wait for the full evidence deadline and
-  // still fail when that cadence landed later. Ask the authenticated extension to scan every
-  // ChatGPT page now. The page/app join remains the same exact request id; this adds urgency,
-  // not a timing fallback or a guessed active-tab identity.
-  if (name === 'agents' && !context.caller.conversationId && requestId) {
-    requestBrowserCorrelationScan(requestId);
-  }
   // Only calls that need an *existing* per-chat workspace before the handler runs are
   // identity-sensitive here. An absolute read or an exec with an explicit absolute workdir is
   // self-contained and must stay fast; if its exact page mate is late, workspace.ts simply

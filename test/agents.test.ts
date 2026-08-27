@@ -1905,6 +1905,34 @@ describe('through the MCP endpoint', () => {
     await expect(pending).resolves.toBeTruthy();
   });
 
+  it('keeps exact-id scans alive for the agents request and stops when the call resolves', async () => {
+    const requestId = 'wfr_agents_late_page_model';
+    const pending = replyWithRequestId(requestId, 'status', {});
+
+    // The live regression: the first forced Fiber read ran before metadata.request_id was in
+    // ChatGPT's page model. A hidden tab's own timer may then be throttled, so the desktop app
+    // must keep waking that exact scan while the MCP call itself is still waiting. No longer
+    // fixed evidence window is the fix; correlation still ends the wait immediately.
+    await vi.waitFor(
+      () => expect(browserControlMocks.requestBrowserCorrelationScan.mock.calls.length).toBeGreaterThanOrEqual(2),
+      { timeout: 3_000 }
+    );
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-late-page-model' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-late-page-model',
+        calls: [{ messageId: 'm-late-page-model', tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+
+    await expect(pending).resolves.toBeTruthy();
+    const scansAtCompletion = browserControlMocks.requestBrowserCorrelationScan.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    expect(browserControlMocks.requestBrowserCorrelationScan).toHaveBeenCalledTimes(scansAtCompletion);
+  });
+
   // One flat tool with five actions. The names it replaced are gone outright, not aliased,
   // so a chat still holding the old instructions gets an honest unknown-tool error.
   it('publishes one agents tool with exactly four actions', async () => {
