@@ -72,4 +72,27 @@ describe('Korean localization', () => {
       dom.window.close();
     }
   });
+
+  it('translates dynamic health values rendered in code elements without changing other code', () => {
+    const dom = new JSDOM(`
+      <div id="facts">
+        <div class="fact"><span>Route to OpenAI</span><code title="not running">not running</code></div>
+        <div class="fact"><span>Tools ChatGPT can see</span><code>9 available · 0 folders</code></div>
+      </div>
+      <p>Keep <code id="protocol-value">NO_REPLY</code> unchanged.</p>
+    `);
+    const previousDocument = globalThis.document;
+    const previousNode = globalThis.Node;
+    Object.assign(globalThis, { document: dom.window.document, Node: dom.window.Node });
+    try {
+      translateKoreanUi(dom.window.document.body);
+      expect(dom.window.document.querySelector('#facts')?.textContent).toContain('실행 중이 아님');
+      expect(dom.window.document.querySelector('#facts')?.textContent).toContain('9개 사용 가능 · 폴더 0개');
+      expect(dom.window.document.querySelector('#facts code')?.getAttribute('title')).toBe('실행 중이 아님');
+      expect(dom.window.document.querySelector('#protocol-value')?.textContent).toBe('NO_REPLY');
+    } finally {
+      Object.assign(globalThis, { document: previousDocument, Node: previousNode });
+      dom.window.close();
+    }
+  });
 });

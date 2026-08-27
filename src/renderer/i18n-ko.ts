@@ -379,6 +379,10 @@ const PROTECTED = [
 ].join(',');
 
 function isProtected(element: Element | null): boolean {
+  // Health fact values use <code> for monospace alignment, but they are application
+  // status text rather than user-authored code. Allow those controlled values through
+  // while preserving every other code/pre block verbatim.
+  if (element?.closest('#facts')) return false;
   return Boolean(element?.closest(PROTECTED));
 }
 
