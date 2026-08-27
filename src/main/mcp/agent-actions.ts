@@ -15,12 +15,15 @@ import {
   agentForCaller,
   deferredAgentAction,
   deferredAgentActionsForRequest,
+  dormantWorkerNotice,
+  endedWorkerNotice,
   noteAgentContextTokens,
   noteDeferredAgentActionOutcomeOffered,
   pendingDeferredAgentActions,
   persistCriticalSwarmNow,
   requestWorkerBootstraps,
   requestWorkerRevivals,
+  retiredWorkerForConversation,
   stageDeferredAgentAction,
   stageDeferredAgentActionOutcome,
   stageFinishAgent,
@@ -228,6 +231,21 @@ async function executeResolvedAction(record: DeferredAgentActionRecord, conversa
   const input = record.input;
   const caller: Caller = { conversationId };
   await repairPrimeFromResumeShadow(conversationId);
+
+  // The outer dispatcher deliberately lets unresolved `agents` requests reach this durable
+  // engine instead of timing them against worker-history fences. Once exact correlation lands,
+  // restore those same fences here before the semantic action runs. A finish retry is the lone
+  // dormant/terminal exception; an explicitly retired worker is never allowed back in.
+  const retired = retiredWorkerForConversation(conversationId);
+  if (retired) {
+    throw new AgentError(
+      `WORKER_RETIRED: ${retired.id} was retired because ${retired.reason}. This chat can no longer use local tools. Stop working and return to the prime chat.`
+    );
+  }
+  if (input.action !== 'finish') {
+    const fenced = dormantWorkerNotice(conversationId) ?? endedWorkerNotice(conversationId);
+    if (fenced) throw new AgentError(fenced);
+  }
 
   if (input.action === 'spawn') {
     const staged = stageSpawn({

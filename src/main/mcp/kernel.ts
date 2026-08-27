@@ -443,7 +443,12 @@ async function dispatchTracked(
   // A run that ended leaves an explicit short-lived lease tombstone for each open worker
   // chat. Resolve exact request identity before ordinary tools too while such leases exist;
   // otherwise an explicit-workdir exec could keep mutating after its worker was retired.
-  if (!context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
+  // `agents` owns a durable exact-id deferral engine. Holding that request inside this outer
+  // lease fence would put the old fixed evidence window back in front of the event-driven
+  // path: a correlation arriving one tick after the wait would be known by the recorder but
+  // the semantic action would already have been refused. Ordinary tools have no such staged
+  // acceptance barrier and must keep waiting/refusing here.
+  if (name !== 'agents' && !context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
     context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
   }
   // Dormant histories are long-lived identity fences, not active slot claims. An old worker tab
@@ -451,7 +456,7 @@ async function dispatchTracked(
   // attribution an absolute read/exec would otherwise look like an unrelated ordinary chat and
   // run successfully. Resolve the exact mate for every call while such worker conversations
   // exist, just as we do for short-lived retired worker leases.
-  if (!context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
+  if (name !== 'agents' && !context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
     context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
   }
   // Two things about liveness, both before the agent is resolved so that the answer this
@@ -508,8 +513,8 @@ async function dispatchTracked(
   // inbox that rode on the missing result. Every other tool call from the same chat is refused
   // by endedWorkerNotice as before.
   const endedWorker = isFinish ? null : endedWorkerNotice(context.caller.conversationId);
-  const retiredLeaseAmbiguous = hasRetiredWorkerLeases() && !context.caller.conversationId;
-  const dormantLeaseAmbiguous = hasDormantWorkerLeases() && !context.caller.conversationId;
+  const retiredLeaseAmbiguous = name !== 'agents' && hasRetiredWorkerLeases() && !context.caller.conversationId;
+  const dormantLeaseAmbiguous = name !== 'agents' && hasDormantWorkerLeases() && !context.caller.conversationId;
   // In a swarm, a relative/defaulted filesystem operation is not safe to execute after the
   // exact caller lookup timed out: its workspace is part of the requested operation. Falling
   // back to the first approved root turns an attribution outage into wrong-project mutation.

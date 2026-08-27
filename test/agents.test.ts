@@ -2165,6 +2165,67 @@ describe('through the MCP endpoint', () => {
     expect(offerMessagesForConversation(PRIME_CHAT)?.messages.filter((message) => message.text.includes('late finish result'))).toHaveLength(1);
   });
 
+  it('lets a new worker finish enter durable identity deferral while an older worker history is dormant', async () => {
+    const oldPrime: Caller = { conversationId: 'c-old-prime-before-deferred-finish' };
+    startSwarm(1, oldPrime);
+    const oldWorker = startWorker('worker-1', 'c-old-worker-before-deferred-finish');
+    finishAgent(oldWorker.caller, 'old history finished');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const currentPrime: Caller = { conversationId: 'c-current-prime-deferred-finish' };
+    startSwarm(1, currentPrime);
+    startWorker('worker-1', 'c-current-worker-deferred-finish');
+
+    const requestId = 'wfr_agents_dormant_fence_deferred_finish';
+    const args = { result: 'current worker finished after late identity' };
+    const reply = replyWithRequestId(requestId, 'finish', args);
+    const fast = await Promise.race([
+      reply.then((value) => ({ kind: 'reply' as const, value })),
+      new Promise<{ kind: 'timeout'; value: null }>((resolve) =>
+        setTimeout(() => resolve({ kind: 'timeout', value: null }), 800)
+      )
+    ]);
+
+    // Before this regression was fixed, the dormant-worker fence held `agents` inside the old
+    // fixed attribution wait. Feed evidence only to let that implementation finish cleanly;
+    // the assertion below still fails because it did not return the durable pending receipt.
+    if (fast.kind === 'timeout') {
+      await recordChatObservations('c-current-worker-deferred-finish', [
+        { kind: 'turn_start', time: Date.now(), turnId: 't-dormant-fence-cleanup' },
+        {
+          kind: 'tool_evidence',
+          time: Date.now(),
+          turnId: 't-dormant-fence-cleanup',
+          calls: [{ messageId: 'm-dormant-fence-cleanup', tool: 'agents', order: 0, answered: false, requestId }]
+        }
+      ]);
+      await reply;
+    }
+
+    expect(fast.kind).toBe('reply');
+    if (fast.kind !== 'reply') return;
+    expect(textOfReply(fast.value)).toMatch(/PENDING_IDENTITY/i);
+    expect(swarmStateForCaller(currentPrime).agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
+
+    await recordChatObservations('c-current-worker-deferred-finish', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-dormant-fence-finish' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-dormant-fence-finish',
+        calls: [{ messageId: 'm-dormant-fence-finish', tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+    await vi.waitFor(() =>
+      expect(swarmStateForCaller(currentPrime).agents.find((agent) => agent.id === 'worker-1')?.state).toBe('sleeping')
+    );
+    expect(
+      offerMessagesForConversation(currentPrime.conversationId)?.messages.filter((message) =>
+        message.text.includes('current worker finished after late identity')
+      )
+    ).toHaveLength(1);
+  });
+
   // One flat tool with five actions. The names it replaced are gone outright, not aliased,
   // so a chat still holding the old instructions gets an honest unknown-tool error.
   it('publishes one agents tool with exactly four actions', async () => {
